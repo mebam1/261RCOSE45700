@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export OPENAI_API_KEY=""
 export OPENAI_MODEL="gpt-4.1-mini"
 
 #python scripts/generate_test_data.py

@@ -72,12 +72,19 @@ class CleanlinessReportsTest(unittest.TestCase):
                 source_path: Path,
                 inspected_path: Path | None = None,
                 prompt_profile: str = PROMPT_PROFILE_RESTAURANT,
+                use_yolo: bool = False,
+                roi: object | None = None,
+                output_stem: str | None = None,
             ) -> CleanlinessResult:
                 self.source_path = source_path
                 self.inspected_path = inspected_path
+                _ = use_yolo
+                _ = roi
+                _ = output_stem
                 return CleanlinessResult(
                     source_path=source_path,
                     inspected_path=inspected_path or source_path,
+                    llm_input_paths=[inspected_path or source_path],
                     score=2,
                     confidence=0.72,
                     summary="Table has visible trash.",
