@@ -6,7 +6,7 @@ FastAPI 기반 로컬 웹 서버로 CCTV/수동 업로드 영상을 분석하고
 
 - Python 3.12 이상
 - PowerShell
-- Gemini API 사용을 위한 `GEMINI_API_KEY`
+- OpenAI API 사용을 위한 `OPENAI_API_KEY`
 
 ## 초기 실행
 
@@ -18,8 +18,8 @@ Copy-Item .env.example .env
 `.env`에 아래 값을 채운다.
 
 ```env
-GEMINI_API_KEY=your_real_key
-GEMINI_MODEL=gemini-2.5-flash
+OPENAI_API_KEY=your_real_key
+OPENAI_MODEL=gpt-4.1-mini
 ```
 
 테스트 데이터가 필요하면 아래 명령을 먼저 실행한다.
@@ -122,6 +122,12 @@ http://127.0.0.1:8000
 $existing = Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty OwningProcess
 if ($existing) { Stop-Process -Id $existing -Force }
 ```
+
+### Docker 컨테이너 실행
+```powershell
+docker run --rm -p 8000:8000 --env-file .env -v "${PWD}\data:/app/data" mvp1-backend:latest
+```
+
 
 ## 테스트
 
