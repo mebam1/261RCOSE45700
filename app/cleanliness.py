@@ -8,6 +8,8 @@ from openai import OpenAI
 
 from app.analysis import OpenAIModelClient
 from app.config import OPENAI_MODEL
+from app.schemas import ROI
+from app.yolo_module import yolo_module
 
 
 CLEANLINESS_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
@@ -68,7 +70,11 @@ RESTAURANT_CLEANLINESS_CONTEXT = (
 
 BASE_CLEANLINESS_ANALYSIS_PROMPT = (
     "Do not create, restore, upscale, enhance, or generate a new image.\n"
-    "Analyze only the provided ROI crop as-is.\n"
+    "You may receive multiple images for the same scene, including the original source image, source image with projected detection boxes, ROI crop, and ROI crop with detection boxes.\n"
+    "Use the ROI crop as the primary evidence.\n"
+    "Treat the original source image and any box overlays as supporting context to understand where detected items are located.\n"
+    "Judge cleanliness only for the target ROI represented by the crop, not for the whole source image.\n"
+    "Analyze the provided ROI crop as-is.\n"
     "\n"
     "First extract visible objects from the ROI crop.\n"
     "Separate objects into two lists:\n"
@@ -99,10 +105,16 @@ def normalize_cleanliness_prompt_profile(prompt_profile: str | None) -> str:
     return PROMPT_PROFILE_RESTAURANT
 
 
-def build_cleanliness_analysis_prompt(prompt_profile: str = DEFAULT_CLEANLINESS_PROMPT_PROFILE) -> str:
+def build_cleanliness_analysis_prompt(
+    prompt_profile: str = DEFAULT_CLEANLINESS_PROMPT_PROFILE,
+    prompt_suffix: str | None = None,
+) -> str:
     normalized = normalize_cleanliness_prompt_profile(prompt_profile)
     context = RESTAURANT_CLEANLINESS_CONTEXT if normalized == PROMPT_PROFILE_RESTAURANT else GENERAL_CLEANLINESS_CONTEXT
-    return context + BASE_CLEANLINESS_ANALYSIS_PROMPT
+    prompt = context + BASE_CLEANLINESS_ANALYSIS_PROMPT
+    if prompt_suffix:
+        prompt += "\n\n" + prompt_suffix.strip()
+    return prompt
 
 
 @dataclass(frozen=True)
@@ -119,6 +131,7 @@ class CleanlinessAssessment:
 class CleanlinessResult:
     source_path: Path
     inspected_path: Path
+    llm_input_paths: list[Path]
     score: int
     confidence: float
     summary: str
@@ -126,11 +139,14 @@ class CleanlinessResult:
     exact_objects: list[str]
     estimated_objects: list[str]
     prompt_profile: str
+    use_yolo: bool = False
+    yolo_payload: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
             "source_path": str(self.source_path),
             "inspected_path": str(self.inspected_path),
+            "llm_input_paths": [str(path) for path in self.llm_input_paths],
             "score": self.score,
             "confidence": round(self.confidence, 3),
             "summary": self.summary,
@@ -138,6 +154,8 @@ class CleanlinessResult:
             "exact_objects": self.exact_objects,
             "estimated_objects": self.estimated_objects,
             "prompt_profile": self.prompt_profile,
+            "use_yolo": self.use_yolo,
+            "yolo_payload": self.yolo_payload,
         }
 
 
@@ -146,6 +164,8 @@ class CleanlinessClient(Protocol):
         self,
         image_path: Path,
         prompt_profile: str = DEFAULT_CLEANLINESS_PROMPT_PROFILE,
+        prompt_suffix: str | None = None,
+        image_paths: list[Path] | None = None,
     ) -> CleanlinessAssessment:
         ...
 
@@ -163,10 +183,12 @@ class OpenAICleanlinessClient(OpenAIModelClient):
         self,
         image_path: Path,
         prompt_profile: str = DEFAULT_CLEANLINESS_PROMPT_PROFILE,
+        prompt_suffix: str | None = None,
+        image_paths: list[Path] | None = None,
     ) -> CleanlinessAssessment:
         payload = self.create_json_response(
-            prompt=build_cleanliness_analysis_prompt(prompt_profile),
-            image_paths=[image_path],
+            prompt=build_cleanliness_analysis_prompt(prompt_profile, prompt_suffix=prompt_suffix),
+            image_paths=image_paths or [image_path],
             schema_name="cleanliness_analysis",
             schema=CLEANLINESS_ANALYSIS_SCHEMA,
             temperature=0.1,
@@ -188,14 +210,22 @@ class OpenAICleanlinessClient(OpenAIModelClient):
 
 
 class CleanlinessService:
-    def __init__(self, client: CleanlinessClient | None = None) -> None:
+    def __init__(
+        self,
+        client: CleanlinessClient | None = None,
+        yolo_helper: yolo_module | None = None,
+    ) -> None:
         self.client = client or OpenAICleanlinessClient()
+        self.yolo_helper = yolo_helper or yolo_module()
 
     def inspect_image(
         self,
         source_path: Path,
         inspected_path: Path | None = None,
         prompt_profile: str = DEFAULT_CLEANLINESS_PROMPT_PROFILE,
+        use_yolo: bool = False,
+        roi: ROI | None = None,
+        output_stem: str | None = None,
     ) -> CleanlinessResult:
         if source_path.suffix.lower() not in CLEANLINESS_IMAGE_EXTENSIONS:
             raise ValueError("image file must be png, jpg, jpeg, bmp, or webp")
@@ -205,10 +235,35 @@ class CleanlinessService:
             raise ValueError("inspection image file must be png, jpg, jpeg, bmp, or webp")
 
         normalized_prompt_profile = normalize_cleanliness_prompt_profile(prompt_profile)
-        assessment = self.client.analyze_cleanliness(target_path, prompt_profile=normalized_prompt_profile)
+        yolo_payload: dict[str, Any] | None = None
+        prompt_suffix: str | None = None
+        llm_input_paths = [target_path]
+        if use_yolo:
+            yolo_result = self.yolo_helper.prepare_for_cleanliness(
+                target_path,
+                source_image_path=source_path,
+                roi=roi,
+                output_stem=output_stem,
+            )
+            yolo_payload = yolo_result.to_dict()
+            prompt_suffix = yolo_result.prompt_instruction
+            llm_input_paths = [source_path]
+            if yolo_result.source_annotated_path is not None:
+                llm_input_paths.append(yolo_result.source_annotated_path)
+            llm_input_paths.append(target_path)
+            if yolo_result.crop_annotated_path is not None:
+                llm_input_paths.append(yolo_result.crop_annotated_path)
+
+        assessment = self.client.analyze_cleanliness(
+            target_path,
+            prompt_profile=normalized_prompt_profile,
+            prompt_suffix=prompt_suffix,
+            image_paths=llm_input_paths,
+        )
         return CleanlinessResult(
             source_path=source_path,
             inspected_path=target_path,
+            llm_input_paths=llm_input_paths,
             score=assessment.score,
             confidence=assessment.confidence,
             summary=assessment.summary,
@@ -216,4 +271,6 @@ class CleanlinessService:
             exact_objects=assessment.exact_objects,
             estimated_objects=assessment.estimated_objects,
             prompt_profile=normalized_prompt_profile,
+            use_yolo=use_yolo,
+            yolo_payload=yolo_payload,
         )

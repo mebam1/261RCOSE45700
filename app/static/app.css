@@ -77,6 +77,11 @@ a {
   margin-bottom: 20px;
 }
 
+.cleanliness-layout {
+  grid-template-columns: minmax(340px, 420px) minmax(0, 1fr);
+  align-items: start;
+}
+
 .wide-left {
   grid-template-columns: 280px 1fr;
 }
@@ -93,6 +98,7 @@ a {
   border: 1px solid #d1d5db;
   border-radius: 8px;
   padding: 18px;
+  min-width: 0;
 }
 
 .metric strong {
@@ -208,6 +214,7 @@ textarea {
   display: flex;
   align-items: center;
   gap: 10px;
+  flex-wrap: wrap;
 }
 
 .prompt-toggle.active {
@@ -427,6 +434,10 @@ textarea {
   line-height: 1.5;
 }
 
+.result-block {
+  margin-top: 16px;
+}
+
 .subhead {
   margin: 18px 0 10px;
   font-size: 16px;
@@ -491,6 +502,21 @@ textarea {
 
 .detection-table {
   margin-top: 16px;
+}
+
+.json-preview {
+  margin: 0;
+  padding: 12px;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  background: #111827;
+  color: #f9fafb;
+  overflow-x: auto;
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 @media (max-width: 980px) {

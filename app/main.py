@@ -384,6 +384,10 @@ def dump_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def form_flag_enabled(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "on", "yes"}
+
+
 def merge_report_filter_options(
     pop_options: dict[str, list[str]],
     cleanliness_options: dict[str, list[str]],
@@ -530,6 +534,7 @@ def cleanliness_page(request: Request, config_id: str | None = Query(default=Non
             "selected_config": selected,
             "selected_roi_name": "",
             "selected_prompt_profile": DEFAULT_CLEANLINESS_PROMPT_PROFILE,
+            "selected_use_yolo": False,
         },
     )
 
@@ -540,6 +545,7 @@ async def cleanliness_upload(
     config_id: str = Form(...),
     roi_name: str = Form(...),
     prompt_profile: str = Form(default=DEFAULT_CLEANLINESS_PROMPT_PROFILE),
+    use_yolo: str = Form(default="false"),
     image_file: UploadFile = File(...),
 ) -> Any:
     try:
@@ -559,12 +565,16 @@ async def cleanliness_upload(
     source_path = save_upload(image_file, UPLOAD_DIR, stem)
     crop_path = save_analysis_crop(read_image(source_path), roi, stem)
     selected_prompt_profile = normalize_cleanliness_prompt_profile(prompt_profile)
+    use_yolo_flag = form_flag_enabled(use_yolo)
 
     try:
         result = cleanliness_service.inspect_image(
             source_path,
             inspected_path=crop_path,
             prompt_profile=selected_prompt_profile,
+            use_yolo=use_yolo_flag,
+            roi=roi,
+            output_stem=stem,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -580,21 +590,33 @@ async def cleanliness_upload(
     payload["source_url"] = data_url(result.source_path)
     payload["crop_url"] = data_url(crop_path)
     payload["llm_input_url"] = data_url(result.inspected_path)
+    payload["llm_input_urls"] = [data_url(path) for path in result.llm_input_paths]
+    yolo_payload = result.yolo_payload or {}
+    crop_annotated_path = Path(str(yolo_payload.get("crop_annotated_path") or "")) if yolo_payload.get("crop_annotated_path") else None
+    source_annotated_path = Path(str(yolo_payload.get("source_annotated_path") or "")) if yolo_payload.get("source_annotated_path") else None
+    payload["crop_annotated_url"] = data_url(crop_annotated_path) if crop_annotated_path else ""
+    payload["source_annotated_url"] = data_url(source_annotated_path) if source_annotated_path else ""
+    payload["pipeline_label"] = "YOLO + LLM" if result.use_yolo else "LLM only"
+    payload["yolo_payload_pretty"] = json.dumps(result.yolo_payload, ensure_ascii=False, indent=2) if result.yolo_payload else ""
     save_cleanliness_record(
         analyzed_at=analyzed_at,
         config=config,
         roi=roi,
-        mode="object",
+        mode="object_yolo" if result.use_yolo else "object",
         decision=object_score_to_decision(result.score),
         score=result.score,
         confidence=result.confidence,
-        final_stage="object_based",
+        final_stage="object_based_yolo" if result.use_yolo else "object_based",
         summary=result.summary,
         source_path=result.source_path,
         crop_path=crop_path,
         exact_objects=result.exact_objects,
         estimated_objects=result.estimated_objects,
         findings=result.findings,
+        action_features={
+            "use_yolo": result.use_yolo,
+            "yolo_payload": result.yolo_payload or {},
+        },
     )
 
     configs = config_store.list_configs()
@@ -610,6 +632,7 @@ async def cleanliness_upload(
             "selected_config": config.to_dict(),
             "selected_roi_name": roi.name,
             "selected_prompt_profile": selected_prompt_profile,
+            "selected_use_yolo": use_yolo_flag,
             "cleanliness_result": payload,
         },
     )

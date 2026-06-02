@@ -22,6 +22,7 @@ def fake_object_result(confidence: float, score: int = 4) -> CleanlinessResult:
     return CleanlinessResult(
         source_path=Path("source.png"),
         inspected_path=Path("crop.png"),
+        llm_input_paths=[Path("crop.png")],
         score=score,
         confidence=confidence,
         summary="Object-based cleanliness summary.",
@@ -96,6 +97,7 @@ class HybridCleanlinessTest(unittest.TestCase):
                 return CleanlinessResult(
                     source_path=source_path,
                     inspected_path=inspected_path or source_path,
+                    llm_input_paths=[inspected_path or source_path],
                     score=3,
                     confidence=self.confidence,
                     summary="Low confidence object result.",
@@ -172,6 +174,7 @@ class HybridCleanlinessTest(unittest.TestCase):
                 return CleanlinessResult(
                     source_path=source_path,
                     inspected_path=inspected_path or source_path,
+                    llm_input_paths=[inspected_path or source_path],
                     score=5,
                     confidence=0.9,
                     summary="High confidence clean table.",
