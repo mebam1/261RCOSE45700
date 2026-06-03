@@ -1,0 +1,171 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="section">
+  <div class="section-head">
+    <h1>Action Workflow Demo</h1>
+    <p>Image sequence or short video uploads can be converted into workflow frames and evaluated with the existing action workflow.</p>
+  </div>
+</section>
+
+<section class="grid-two">
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Image Sequence</h2>
+    </div>
+    <form id="workflow-images-form" class="stack-gap" enctype="multipart/form-data">
+      <label>
+        <span>Store ID</span>
+        <input type="text" name="store_id" value="{{ store_id }}" required>
+      </label>
+      <label>
+        <span>Table ID</span>
+        <input type="text" name="table_id" value="{{ table_id }}" required>
+      </label>
+      <label>
+        <span>Zone ID</span>
+        <input type="text" name="zone_id" value="{{ zone_id }}" required>
+      </label>
+      <label>
+        <span>Captured At Start</span>
+        <input type="text" name="captured_at_start" value="{{ captured_at_start }}" placeholder="YYYY-MM-DDTHH:mm:ss" required>
+      </label>
+      <label>
+        <span>Interval Seconds</span>
+        <input type="number" name="interval_seconds" value="{{ interval_seconds }}" min="1" step="1" required>
+      </label>
+      <label>
+        <span>Interaction ROI JSON</span>
+        <textarea name="interaction_roi_json" rows="6" placeholder='{"name":"TABLE","points":[{"x":0,"y":0},{"x":100,"y":0},{"x":100,"y":100},{"x":0,"y":100}]}'>{{ interaction_roi_json }}</textarea>
+      </label>
+      <label>
+        <span>Staff Zone Visits JSON</span>
+        <textarea name="staff_zone_visits_json" rows="10">{{ staff_zone_visits_json }}</textarea>
+      </label>
+      <label>
+        <span>Visual Payload Preset</span>
+        <select name="preset">
+          {% for item in ["cleaned_likely", "cleaning_unverified", "missed_suspected", "high_mess_cap"] %}
+          <option value="{{ item }}" {% if selected_preset == item %}selected{% endif %}>{{ item }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        <span>Visual Payloads JSON</span>
+        <textarea name="visual_payloads_json" rows="10" placeholder='[{"objects":[{"class":"cup","confidence":0.91}]},{"objects":[]}]'>{{ visual_payloads_json }}</textarea>
+      </label>
+      <label>
+        <span>Images</span>
+        <input type="file" name="image_files" accept=".png,.jpg,.jpeg,.bmp,.webp" multiple required>
+      </label>
+      <label class="checkbox-row no-top-pad">
+        <input type="checkbox" name="save_result" value="true" {% if save_result %}checked{% endif %}>
+        <span>Save result to reports</span>
+      </label>
+      <button type="submit" class="primary-button">Run Image Workflow</button>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Short Video</h2>
+    </div>
+    <form id="workflow-video-form" class="stack-gap" enctype="multipart/form-data">
+      <label>
+        <span>Store ID</span>
+        <input type="text" name="store_id" value="{{ store_id }}" required>
+      </label>
+      <label>
+        <span>Table ID</span>
+        <input type="text" name="table_id" value="{{ table_id }}" required>
+      </label>
+      <label>
+        <span>Zone ID</span>
+        <input type="text" name="zone_id" value="{{ zone_id }}" required>
+      </label>
+      <label>
+        <span>Captured At Start</span>
+        <input type="text" name="captured_at_start" value="{{ captured_at_start }}" placeholder="YYYY-MM-DDTHH:mm:ss" required>
+      </label>
+      <label>
+        <span>Interval Seconds</span>
+        <input type="number" name="interval_seconds" value="{{ interval_seconds }}" min="1" step="1" required>
+      </label>
+      <label>
+        <span>Max Frames</span>
+        <input type="number" name="max_frames" value="{{ max_frames }}" min="2" step="1" required>
+      </label>
+      <label>
+        <span>Interaction ROI JSON</span>
+        <textarea name="interaction_roi_json" rows="6" placeholder='{"name":"TABLE","points":[{"x":0,"y":0},{"x":100,"y":0},{"x":100,"y":100},{"x":0,"y":100}]}'>{{ interaction_roi_json }}</textarea>
+      </label>
+      <label>
+        <span>Staff Zone Visits JSON</span>
+        <textarea name="staff_zone_visits_json" rows="10">{{ staff_zone_visits_json }}</textarea>
+      </label>
+      <label>
+        <span>Visual Payload Preset</span>
+        <select name="preset">
+          {% for item in ["cleaned_likely", "cleaning_unverified", "missed_suspected", "high_mess_cap"] %}
+          <option value="{{ item }}" {% if selected_preset == item %}selected{% endif %}>{{ item }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        <span>Visual Payloads JSON</span>
+        <textarea name="visual_payloads_json" rows="10">{{ visual_payloads_json }}</textarea>
+      </label>
+      <label>
+        <span>Video</span>
+        <input type="file" name="video_file" accept=".mp4,.mov,.m4v,.avi,.webm,.mkv" required>
+      </label>
+      <label class="checkbox-row no-top-pad">
+        <input type="checkbox" name="save_result" value="true" {% if save_result %}checked{% endif %}>
+        <span>Save result to reports</span>
+      </label>
+      <button type="submit" class="primary-button">Run Video Workflow</button>
+    </form>
+  </section>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>Result JSON</h2>
+  </div>
+  <p class="helper" id="workflow-demo-status">Run one of the forms above to see the workflow result.</p>
+  <p class="helper" id="workflow-demo-reports" hidden>
+    Saved to DB. <a href="/reports?cleanliness_mode=action_workflow">Open reports</a>
+  </p>
+  <pre id="workflow-demo-result" class="helper"></pre>
+</section>
+
+<script>
+  async function submitWorkflowForm(formId, endpoint) {
+    const form = document.getElementById(formId);
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const status = document.getElementById("workflow-demo-status");
+      const result = document.getElementById("workflow-demo-result");
+      const reports = document.getElementById("workflow-demo-reports");
+      status.textContent = "Running workflow...";
+      result.textContent = "";
+      reports.hidden = true;
+
+      const response = await fetch(endpoint, {
+        method: "POST",
+        body: new FormData(form),
+      });
+      const payload = await response.json();
+      result.textContent = JSON.stringify(payload, null, 2);
+      if (response.ok) {
+        status.textContent = "Workflow completed.";
+        reports.hidden = !payload.saved;
+      } else {
+        status.textContent = `Request failed (${response.status}).`;
+      }
+    });
+  }
+
+  submitWorkflowForm("workflow-images-form", "/api/action-cleanliness/workflow-from-images");
+  submitWorkflowForm("workflow-video-form", "/api/action-cleanliness/workflow-from-video");
+</script>
+{% endblock %}

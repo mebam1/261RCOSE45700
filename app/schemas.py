@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field
+
 
 def safe_filename_part(value: str) -> str:
     banned = '<>:"/\\|?*'
@@ -160,3 +162,38 @@ class CCTVConfig:
             "areas": [area.to_dict() for area in self.areas],
             "created_at": self.created_at,
         }
+
+
+class ActionWorkflowFrameRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    captured_at: datetime
+    person_present: bool
+    person_count: int = Field(default=0, ge=0)
+    payload: dict[str, Any] = Field(default_factory=dict)
+    occupancy_source: str | None = None
+    occupancy_reason_codes: list[str] = Field(default_factory=list)
+
+
+class ActionWorkflowStaffVisitRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    visit_id: str
+    staff_id: str
+    zone_id: str
+    entered_at: datetime
+    left_at: datetime
+    dwell_seconds: float = Field(ge=0)
+    mean_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    sample_count: int = Field(default=0, ge=0)
+
+
+class ActionWorkflowRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    store_id: str
+    table_id: str
+    zone_id: str
+    save_result: bool = False
+    frames: list[ActionWorkflowFrameRequest] = Field(min_length=2)
+    staff_zone_visits: list[ActionWorkflowStaffVisitRequest] = Field(default_factory=list)

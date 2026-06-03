@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -179,6 +180,82 @@ class CleanlinessReportsTest(unittest.TestCase):
         self.assertIn("RealCam", response.text)
         self.assertIn("queued", response.text)
         self.assertIn("Video analysis job accepted.", response.text)
+
+    def test_reports_page_renders_action_workflow_details_from_action_features(self) -> None:
+        insert_cleanliness_result(
+            {
+                "analyzed_at": datetime(2026, 6, 3, 14, 45).isoformat(timespec="minutes"),
+                "store_name": "store_001",
+                "cctv_id": "store_001::zone_B",
+                "cctv_nickname": "zone_B",
+                "roi_name": "T06",
+                "mode": "action_workflow",
+                "decision": "cleaned_likely",
+                "score": 5,
+                "confidence": 0.85,
+                "final_stage": "workflow_api",
+                "summary": "Stored workflow summary.",
+                "source_path": "",
+                "crop_path": "",
+                "exact_objects": "[]",
+                "estimated_objects": "[]",
+                "findings": "[]",
+                "action_features": json.dumps(
+                    {
+                        "final_cleanliness_score": 92,
+                        "result": {
+                            "cleaning_status": "CLEANED_LIKELY",
+                            "action_score": 0.85,
+                            "visual_score": 100,
+                            "applied_caps": [],
+                            "reason_codes": ["CUSTOMER_LEFT_CONFIRMED", "TABLE_STATE_CHANGED"],
+                            "explanation": "Workflow explanation from action_features.",
+                            "final_cleanliness_score": 92,
+                        },
+                    }
+                ),
+            }
+        )
+
+        client = TestClient(main_module.app)
+        response = client.get("/reports", params={"cleanliness_mode": "action_workflow"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("final 92 / 100", response.text)
+        self.assertIn("status: CLEANED_LIKELY", response.text)
+        self.assertIn("action: 0.85", response.text)
+        self.assertIn("visual: 100 / 100", response.text)
+        self.assertIn("CUSTOMER_LEFT_CONFIRMED", response.text)
+        self.assertIn("Workflow explanation from action_features.", response.text)
+
+    def test_reports_page_handles_invalid_action_features_json_without_breaking(self) -> None:
+        insert_cleanliness_result(
+            {
+                "analyzed_at": datetime(2026, 6, 3, 14, 45).isoformat(timespec="minutes"),
+                "store_name": "store_001",
+                "cctv_id": "store_001::zone_B",
+                "cctv_nickname": "zone_B",
+                "roi_name": "T06",
+                "mode": "action_workflow",
+                "decision": "cleaned_likely",
+                "score": 5,
+                "confidence": 0.85,
+                "final_stage": "workflow_api",
+                "summary": "Broken action_features should not crash reports.",
+                "source_path": "",
+                "crop_path": "",
+                "exact_objects": "[]",
+                "estimated_objects": "[]",
+                "findings": "[]",
+                "action_features": "{not-json",
+            }
+        )
+
+        client = TestClient(main_module.app)
+        response = client.get("/reports", params={"cleanliness_mode": "action_workflow"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Broken action_features should not crash reports.", response.text)
 
     def test_reports_page_includes_configured_store_without_results(self) -> None:
         original_store = main_module.config_store

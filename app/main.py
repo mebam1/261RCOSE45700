@@ -4,7 +4,7 @@ import json
 import shutil
 import tempfile
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus
@@ -17,9 +17,13 @@ from fastapi.templating import Jinja2Templates
 
 from app.action_cleanliness import (
     ActionCleanlinessService,
+    StaffZoneVisit,
     SAMPLE_ORDER_TIME,
     SAMPLE_PAYMENT_COMPLETED_TIME,
     SAMPLE_TRAJECTORY_JSON,
+    TableOccupancySample,
+    YoloTableState,
+    ZoneTableMapping,
     parse_action_time_value,
     parse_trajectory_json,
 )
@@ -31,6 +35,7 @@ from app.cleanliness import (
     CleanlinessService,
     normalize_cleanliness_prompt_profile,
 )
+from app.cleanliness_metric import normalize_visual_metric_input
 from app.config import (
     DATA_DIR,
     FRONTEND_DIR,
@@ -55,11 +60,25 @@ from app.database import (
     insert_cleanliness_result,
     update_cleanliness_result,
 )
-from app.hybrid_cleanliness import OBJECT_CONFIDENCE_THRESHOLD, build_hybrid_cleanliness_result, object_score_to_decision
+from app.hybrid_cleanliness import (
+    OBJECT_CONFIDENCE_THRESHOLD,
+    build_final_cleanliness_result,
+    build_hybrid_cleanliness_result,
+    object_score_to_decision,
+)
 from app.person_masking import IMAGE_EXTENSIONS, PersonMaskService
 from app.roi_store import ConfigStore
-from app.schemas import ROI, safe_filename_part
+from app.schemas import (
+    ActionWorkflowRequest,
+    ROI,
+    safe_filename_part,
+)
 from app.video_cleanliness import VIDEO_CLEANLINESS_EXTENSIONS, VideoCleanlinessService
+from app.vision_workflow_preprocessor import (
+    build_workflow_frames_from_images,
+    build_workflow_frames_from_video,
+    sample_video_workflow_frames,
+)
 
 
 app = FastAPI(title="MVP1 Franchise Quality Monitor")
@@ -118,6 +137,24 @@ def auth_payload(user_id: str) -> dict[str, str]:
         "token_type": "bearer",
         "user_id": user_id,
     }
+
+
+ACTION_WORKFLOW_DEMO_STAFF_VISITS_JSON = json.dumps(
+    [
+        {
+            "visit_id": "visit_000341",
+            "staff_id": "staff_03",
+            "zone_id": "zone_B",
+            "entered_at": "2026-06-03T14:44:10",
+            "left_at": "2026-06-03T14:44:36",
+            "dwell_seconds": 26,
+            "mean_confidence": 0.76,
+            "sample_count": 8,
+        }
+    ],
+    ensure_ascii=False,
+    indent=2,
+)
 
 
 def current_owner_id(authorization: str | None = Header(default=None)) -> str:
@@ -384,6 +421,52 @@ def dump_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def action_workflow_report_details(record: dict[str, Any]) -> dict[str, Any] | None:
+    if record.get("mode") != "action_workflow":
+        return None
+
+    raw_action_features = record.get("action_features")
+    if not raw_action_features:
+        return {}
+
+    try:
+        payload = json.loads(raw_action_features)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+
+    result_payload = payload.get("result")
+    if not isinstance(result_payload, dict):
+        result_payload = {}
+
+    applied_caps = result_payload.get("applied_caps")
+    if not isinstance(applied_caps, list):
+        applied_caps = []
+
+    reason_codes = result_payload.get("reason_codes")
+    if not isinstance(reason_codes, list):
+        reason_codes = []
+
+    explanation = result_payload.get("explanation")
+    if not isinstance(explanation, str):
+        explanation = ""
+
+    return {
+        "final_cleanliness_score": payload.get("final_cleanliness_score", result_payload.get("final_cleanliness_score")),
+        "cleaning_status": result_payload.get("cleaning_status"),
+        "action_score": result_payload.get("action_score"),
+        "visual_score": result_payload.get("visual_score"),
+        "applied_caps": applied_caps,
+        "reason_codes": reason_codes,
+        "explanation": explanation,
+    }
+
+
+def with_action_workflow_report_details(record: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(record)
+    payload["action_workflow_details"] = action_workflow_report_details(record)
+    return payload
+
+
 def merge_report_filter_options(
     pop_options: dict[str, list[str]],
     cleanliness_options: dict[str, list[str]],
@@ -472,6 +555,308 @@ def resolve_roi_for_action(config: Any, table_roi_index: str | int | None, roi_n
                 return roi, index
 
     raise KeyError("roi not found")
+
+
+def workflow_observations_from_frames(
+    frames: list[Any],
+    *,
+    customer_in_use_seconds: int,
+    meal_end_seconds: int,
+) -> list[TableOccupancySample]:
+    sorted_frames = sorted(frames, key=lambda item: item.captured_at)
+    observations: list[TableOccupancySample] = []
+
+    for index, frame in enumerate(sorted_frames):
+        observations.append(
+            TableOccupancySample(
+                timestamp=frame.captured_at,
+                customer_present=frame.person_present,
+            )
+        )
+        if index + 1 >= len(sorted_frames):
+            continue
+
+        next_frame = sorted_frames[index + 1]
+        if frame.person_present and next_frame.captured_at - frame.captured_at >= timedelta(seconds=customer_in_use_seconds):
+            observations.append(
+                TableOccupancySample(
+                    timestamp=frame.captured_at + timedelta(seconds=customer_in_use_seconds),
+                    customer_present=True,
+                )
+            )
+        if (not frame.person_present) and next_frame.captured_at - frame.captured_at >= timedelta(seconds=meal_end_seconds):
+            observations.append(
+                TableOccupancySample(
+                    timestamp=frame.captured_at + timedelta(seconds=meal_end_seconds),
+                    customer_present=False,
+                )
+            )
+
+    return sorted(observations, key=lambda item: item.timestamp)
+
+
+def workflow_visual_state_from_frame(
+    frame: Any,
+    *,
+    table_id: str,
+) -> YoloTableState:
+    payload = dict(frame.payload)
+    payload.setdefault("table_id", table_id)
+    payload.setdefault("captured_at", frame.captured_at.isoformat(timespec="seconds"))
+    return normalize_visual_metric_input(payload, table_id=table_id)
+
+
+def workflow_staff_visits_from_request(payload: ActionWorkflowRequest) -> list[StaffZoneVisit]:
+    visits: list[StaffZoneVisit] = []
+    for visit in payload.staff_zone_visits:
+        visits.append(
+            StaffZoneVisit.from_dict(
+                {
+                    "visit_id": visit.visit_id,
+                    "store_id": payload.store_id,
+                    "staff_id": visit.staff_id,
+                    "zone_id": visit.zone_id,
+                    "entered_at": visit.entered_at.isoformat(timespec="seconds"),
+                    "left_at": visit.left_at.isoformat(timespec="seconds"),
+                    "dwell_seconds": visit.dwell_seconds,
+                    "mean_confidence": visit.mean_confidence,
+                    "sample_count": visit.sample_count,
+                }
+            )
+        )
+    return visits
+
+
+def execute_action_cleanliness_workflow(payload: ActionWorkflowRequest) -> dict[str, Any]:
+    observations = workflow_observations_from_frames(
+        payload.frames,
+        customer_in_use_seconds=action_cleanliness_service.customer_in_use_seconds,
+        meal_end_seconds=action_cleanliness_service.meal_end_seconds,
+    )
+    meal_session = action_cleanliness_service.evaluate_meal_session(payload.table_id, observations)
+    if meal_session is None:
+        raise HTTPException(status_code=400, detail="insufficient frame timeline to create a meal session")
+    if meal_session.meal_ended_at is None:
+        raise HTTPException(status_code=400, detail="frame timeline did not reach MEAL_ENDED")
+
+    zone_mapping = ZoneTableMapping.from_dict(
+        {
+            "store_id": payload.store_id,
+            "zones": [
+                {
+                    "zone_id": payload.zone_id,
+                    "beacon_ids": [],
+                    "table_ids": [payload.table_id],
+                }
+            ],
+        }
+    )
+    cleaning_task = action_cleanliness_service.create_cleaning_task(meal_session, zone_mapping)
+
+    sorted_frames = sorted(payload.frames, key=lambda item: item.captured_at)
+    after_frame = sorted_frames[-1]
+    before_frame = next(
+        (frame for frame in reversed(sorted_frames) if frame.captured_at <= meal_session.meal_ended_at),
+        sorted_frames[0],
+    )
+    before_state = workflow_visual_state_from_frame(before_frame, table_id=payload.table_id)
+    after_state = workflow_visual_state_from_frame(after_frame, table_id=payload.table_id)
+    staff_zone_visits = workflow_staff_visits_from_request(payload)
+
+    action_result = action_cleanliness_service.evaluate_cleaning_task(
+        cleaning_task,
+        before_state=before_state,
+        after_state=after_state,
+        staff_zone_visits=staff_zone_visits,
+        meal_session=meal_session,
+        as_of=after_frame.captured_at,
+    )
+    final_result = build_final_cleanliness_result(action_result, after_state)
+    merged_reason_codes = list(dict.fromkeys([*action_result.reason_codes, *final_result.reason_codes]))
+
+    response_payload = {
+        "store_id": payload.store_id,
+        "table_id": payload.table_id,
+        "zone_id": payload.zone_id,
+        "saved": False,
+        "result_id": None,
+        "meal_status": action_result.meal_status,
+        "cleaning_status": action_result.cleaning_status,
+        "action_score": round(action_result.action_score, 2),
+        "visual_score": final_result.visual_score,
+        "visual_clean_score": round(final_result.visual_clean_score, 2),
+        "visual_mess_score": round(final_result.visual_mess_score, 2),
+        "final_cleanliness_score": final_result.final_cleanliness_score,
+        "final_grade": final_result.final_grade,
+        "decision": final_result.decision,
+        "applied_caps": final_result.applied_caps,
+        "reason_codes": merged_reason_codes,
+        "explanation": final_result.explanation,
+    }
+    return {
+        "response": response_payload,
+        "action_result": action_result,
+        "final_result": final_result,
+        "after_state": after_state,
+        "evaluated_at": after_frame.captured_at,
+    }
+
+
+def run_action_cleanliness_workflow(payload: ActionWorkflowRequest) -> dict[str, Any]:
+    return execute_action_cleanliness_workflow(payload)["response"]
+
+
+def workflow_report_decision(cleaning_status: str) -> str:
+    if cleaning_status == "CLEANED_LIKELY":
+        return "cleaned_likely"
+    if cleaning_status in {"CLEANING_UNVERIFIED", "MISSED_SUSPECTED", "NEED_CLEANING"}:
+        return "needs_check"
+    return "unknown"
+
+
+def report_score_from_final_cleanliness_score(final_cleanliness_score: int) -> int:
+    if final_cleanliness_score >= 90:
+        return 5
+    if final_cleanliness_score >= 70:
+        return 4
+    if final_cleanliness_score >= 50:
+        return 3
+    if final_cleanliness_score >= 30:
+        return 2
+    return 1
+
+
+def parse_demo_json_field(raw_value: str | None, field_name: str, *, default: Any) -> Any:
+    if raw_value is None or not raw_value.strip():
+        return default
+    try:
+        return json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"invalid {field_name}") from exc
+
+
+def parse_interaction_roi_json(raw_value: str | None) -> ROI | None:
+    payload = parse_demo_json_field(raw_value, "interaction_roi_json", default=None)
+    if payload is None:
+        return None
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="invalid interaction_roi_json")
+    try:
+        return ROI.from_dict(payload)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="invalid interaction_roi_json") from exc
+
+
+def parse_staff_zone_visits_json(raw_value: str | None) -> list[dict[str, Any]]:
+    payload = parse_demo_json_field(raw_value, "staff_zone_visits_json", default=[])
+    if not isinstance(payload, list):
+        raise HTTPException(status_code=400, detail="invalid staff_zone_visits_json")
+    return payload
+
+
+def demo_visual_payload_template(name: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    before_payload = {
+        "objects": [
+            {"class": "cup", "confidence": 0.91},
+            {"class": "tray", "confidence": 0.84},
+        ],
+        "vision_confidence": 0.84,
+    }
+    if name == "cleaned_likely":
+        return before_payload, {
+            "objects": [],
+            "vision_confidence": 0.84,
+        }
+    if name == "cleaning_unverified":
+        return before_payload, dict(before_payload)
+    if name == "missed_suspected":
+        return before_payload, dict(before_payload)
+    if name == "high_mess_cap":
+        return before_payload, {
+            "yolo_mess_score": 0.80,
+            "detected_objects": [
+                {"class": "trash", "count": 1, "max_confidence": 0.71},
+            ],
+            "vision_confidence": 0.88,
+        }
+    raise HTTPException(status_code=400, detail="invalid preset")
+
+
+def resolve_demo_visual_payloads(
+    *,
+    frame_count: int,
+    visual_payloads_json: str | None,
+    preset: str | None,
+) -> list[dict[str, Any]]:
+    payload = parse_demo_json_field(visual_payloads_json, "visual_payloads_json", default=None)
+    if payload is not None:
+        if isinstance(payload, dict):
+            return [dict(payload) for _ in range(frame_count)]
+        if not isinstance(payload, list):
+            raise HTTPException(status_code=400, detail="invalid visual_payloads_json")
+        if len(payload) != frame_count:
+            raise HTTPException(status_code=400, detail="visual_payloads_json length must match file count")
+        if not all(isinstance(item, dict) for item in payload):
+            raise HTTPException(status_code=400, detail="invalid visual_payloads_json")
+        return [dict(item) for item in payload]
+
+    if preset:
+        before_payload, after_payload = demo_visual_payload_template(preset)
+        payloads = [dict(before_payload) for _ in range(frame_count)]
+        if payloads:
+            payloads[-1] = dict(after_payload)
+        return payloads
+
+    return [{} for _ in range(frame_count)]
+
+
+def build_action_workflow_response(payload: ActionWorkflowRequest) -> dict[str, Any]:
+    workflow_run = execute_action_cleanliness_workflow(payload)
+    response_payload = dict(workflow_run["response"])
+    if payload.save_result:
+        response_payload["result_id"] = save_action_cleanliness_workflow_result(payload, workflow_run)
+        response_payload["saved"] = True
+    response_payload["frames"] = payload.model_dump(mode="json")["frames"]
+    return response_payload
+
+
+def save_action_cleanliness_workflow_result(payload: ActionWorkflowRequest, workflow_run: dict[str, Any]) -> int:
+    response_payload = dict(workflow_run["response"])
+    action_result = workflow_run["action_result"]
+    after_state = workflow_run["after_state"]
+    exact_objects = [
+        item.object_class if item.count == 1 else f"{item.object_class} x{item.count}"
+        for item in after_state.detected_objects
+    ]
+    action_features = {
+        "request": payload.model_dump(mode="json"),
+        "result": response_payload,
+        "final_cleanliness_score": response_payload["final_cleanliness_score"],
+        "action_confidence": round(action_result.action_confidence, 2),
+        "visual_penalties_breakdown": workflow_run["final_result"].penalties_breakdown,
+        "visual_bonuses_breakdown": workflow_run["final_result"].bonuses_breakdown,
+    }
+    return insert_cleanliness_result(
+        {
+            "analyzed_at": workflow_run["evaluated_at"].isoformat(timespec="minutes"),
+            "store_name": payload.store_id,
+            "cctv_id": f"{payload.store_id}::{payload.zone_id}",
+            "cctv_nickname": payload.zone_id,
+            "roi_name": payload.table_id,
+            "mode": "action_workflow",
+            "decision": workflow_report_decision(action_result.cleaning_status),
+            "score": report_score_from_final_cleanliness_score(response_payload["final_cleanliness_score"]),
+            "confidence": action_result.action_confidence,
+            "final_stage": "workflow_api",
+            "summary": response_payload["explanation"],
+            "source_path": "",
+            "crop_path": "",
+            "exact_objects": dump_json(exact_objects),
+            "estimated_objects": dump_json([]),
+            "findings": dump_json(response_payload["reason_codes"]),
+            "action_features": dump_json(action_features),
+        }
+    )
 
 
 def save_cleanliness_record(
@@ -856,6 +1241,29 @@ def action_cleanliness_page(request: Request, config_id: str | None = Query(defa
     )
 
 
+@app.get("/action-workflow-demo")
+def action_workflow_demo_page(request: Request) -> Any:
+    return templates.TemplateResponse(
+        request,
+        "action_workflow_demo.html",
+        {
+            "request": request,
+            "title": "Action Workflow Demo",
+            "captured_at_start": "2026-06-03T14:10:20",
+            "interval_seconds": 60,
+            "max_frames": 10,
+            "store_id": "store_001",
+            "table_id": "T06",
+            "zone_id": "zone_B",
+            "save_result": False,
+            "staff_zone_visits_json": ACTION_WORKFLOW_DEMO_STAFF_VISITS_JSON,
+            "interaction_roi_json": "",
+            "visual_payloads_json": "",
+            "selected_preset": "cleaned_likely",
+        },
+    )
+
+
 @app.post("/action-cleanliness")
 async def action_cleanliness_submit(
     request: Request,
@@ -932,6 +1340,134 @@ async def action_cleanliness_submit(
             "action_result": payload,
         },
     )
+
+
+@app.post("/api/action-cleanliness/workflow")
+async def action_cleanliness_workflow_api(payload: ActionWorkflowRequest) -> JSONResponse:
+    return JSONResponse(build_action_workflow_response(payload))
+
+
+@app.post("/api/action-cleanliness/workflow-from-images")
+async def action_cleanliness_workflow_from_images(
+    store_id: str = Form(...),
+    table_id: str = Form(...),
+    zone_id: str = Form(...),
+    captured_at_start: str = Form(...),
+    interval_seconds: float = Form(default=30.0),
+    save_result: bool = Form(default=False),
+    interaction_roi_json: str = Form(default=""),
+    staff_zone_visits_json: str = Form(default=""),
+    visual_payloads_json: str = Form(default=""),
+    preset: str = Form(default=""),
+    image_files: list[UploadFile] = File(...),
+) -> JSONResponse:
+    if not image_files:
+        raise HTTPException(status_code=400, detail="at least one image file is required")
+    if interval_seconds <= 0:
+        raise HTTPException(status_code=400, detail="interval_seconds must be greater than 0")
+
+    interaction_roi = parse_interaction_roi_json(interaction_roi_json)
+    staff_zone_visits = parse_staff_zone_visits_json(staff_zone_visits_json)
+    payloads = resolve_demo_visual_payloads(
+        frame_count=len(image_files),
+        visual_payloads_json=visual_payloads_json,
+        preset=preset,
+    )
+
+    with tempfile.TemporaryDirectory() as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+        image_paths: list[Path] = []
+        for index, image_file in enumerate(image_files):
+            suffix = Path(image_file.filename or "").suffix.lower()
+            if suffix not in IMAGE_EXTENSIONS:
+                raise HTTPException(status_code=400, detail="image files must be png, jpg, jpeg, bmp, or webp")
+            image_paths.append(save_upload(image_file, temp_dir, f"workflow_image_{index:02d}"))
+
+        frames = build_workflow_frames_from_images(
+            image_paths=image_paths,
+            start_time=captured_at_start,
+            interval_seconds=interval_seconds,
+            table_id=table_id,
+            interaction_roi=interaction_roi,
+            payloads=payloads,
+            person_mask_service=person_mask_service,
+        )
+    if len(frames) < 2:
+        raise HTTPException(status_code=400, detail="at least two frames are required")
+
+    payload = ActionWorkflowRequest(
+        store_id=store_id,
+        table_id=table_id,
+        zone_id=zone_id,
+        save_result=save_result,
+        frames=frames,
+        staff_zone_visits=staff_zone_visits,
+    )
+    return JSONResponse(build_action_workflow_response(payload))
+
+
+@app.post("/api/action-cleanliness/workflow-from-video")
+async def action_cleanliness_workflow_from_video(
+    store_id: str = Form(...),
+    table_id: str = Form(...),
+    zone_id: str = Form(...),
+    captured_at_start: str = Form(...),
+    interval_seconds: float = Form(default=30.0),
+    max_frames: int = Form(default=10),
+    save_result: bool = Form(default=False),
+    interaction_roi_json: str = Form(default=""),
+    staff_zone_visits_json: str = Form(default=""),
+    visual_payloads_json: str = Form(default=""),
+    preset: str = Form(default=""),
+    video_file: UploadFile = File(...),
+) -> JSONResponse:
+    suffix = Path(video_file.filename or "").suffix.lower()
+    if suffix not in VIDEO_CLEANLINESS_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="video file must be mp4, mov, m4v, avi, webm, or mkv")
+    if interval_seconds <= 0:
+        raise HTTPException(status_code=400, detail="interval_seconds must be greater than 0")
+    if max_frames <= 0:
+        raise HTTPException(status_code=400, detail="max_frames must be greater than 0")
+
+    interaction_roi = parse_interaction_roi_json(interaction_roi_json)
+    staff_zone_visits = parse_staff_zone_visits_json(staff_zone_visits_json)
+
+    with tempfile.TemporaryDirectory() as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+        video_path = save_upload(video_file, temp_dir, "workflow_video")
+        samples = sample_video_workflow_frames(
+            video_path=video_path,
+            interval_seconds=interval_seconds,
+            max_frames=max_frames,
+        )
+        payloads = resolve_demo_visual_payloads(
+            frame_count=len(samples),
+            visual_payloads_json=visual_payloads_json,
+            preset=preset,
+        )
+        frames = build_workflow_frames_from_video(
+            video_path=video_path,
+            captured_at_start=captured_at_start,
+            interval_seconds=interval_seconds,
+            max_frames=max_frames,
+            table_id=table_id,
+            interaction_roi=interaction_roi,
+            payload_builder=lambda _image, index, **_: payloads[index],
+            person_mask_service=person_mask_service,
+            frame_extractor=lambda _path, **__: list(samples),
+        )
+    if len(frames) < 2:
+        raise HTTPException(status_code=400, detail="at least two frames are required")
+
+    payload = ActionWorkflowRequest(
+        store_id=store_id,
+        table_id=table_id,
+        zone_id=zone_id,
+        save_result=save_result,
+        frames=frames,
+        staff_zone_visits=staff_zone_visits,
+    )
+    return JSONResponse(build_action_workflow_response(payload))
 
 
 @app.get("/hybrid-cleanliness")
@@ -1239,7 +1775,7 @@ def reports_page(
     }
     records = [with_human_clear_ratio(row) for row in fetch_results(pop_filters)]
     latest_pop = [with_human_clear_ratio(row) for row in fetch_latest_by_roi(roi_name if roi_name else "POP")]
-    cleanliness_records = fetch_cleanliness_results(cleanliness_filters)
+    cleanliness_records = [with_action_workflow_report_details(row) for row in fetch_cleanliness_results(cleanliness_filters)]
     configs = config_store.list_configs()
     cleanliness_store_summary = merge_configured_store_summary(
         fetch_cleanliness_store_summary(cleanliness_filters),

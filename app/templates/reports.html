@@ -154,9 +154,27 @@
         <td>{{ row.mode }}</td>
         <td>{{ row.final_stage }}</td>
         <td><span class="status {{ row.decision }}">{{ row.decision }}</span></td>
-        <td>{% if row.score is not none %}{{ row.score }} / 5{% else %}-{% endif %}</td>
+        <td>
+          {% if row.score is not none %}{{ row.score }} / 5{% else %}-{% endif %}
+          {% if row.action_workflow_details and row.action_workflow_details.final_cleanliness_score is not none %}
+          <div class="muted-text">final {{ row.action_workflow_details.final_cleanliness_score }} / 100</div>
+          {% endif %}
+        </td>
         <td>{{ "%.0f"|format(row.confidence * 100) }}%</td>
       </tr>
+      {% if row.action_workflow_details %}
+      <tr>
+        <td colspan="9" class="summary-cell">
+          <strong>workflow</strong>
+          {% if row.action_workflow_details.cleaning_status %} | status: {{ row.action_workflow_details.cleaning_status }}{% endif %}
+          {% if row.action_workflow_details.action_score is not none %} | action: {{ row.action_workflow_details.action_score }}{% endif %}
+          {% if row.action_workflow_details.visual_score is not none %} | visual: {{ row.action_workflow_details.visual_score }} / 100{% endif %}
+          {% if row.action_workflow_details.applied_caps %} | caps: {{ row.action_workflow_details.applied_caps|join(", ") }}{% endif %}
+          {% if row.action_workflow_details.reason_codes %}<br>reasons: {{ row.action_workflow_details.reason_codes|join(", ") }}{% endif %}
+          {% if row.action_workflow_details.explanation %}<br>{{ row.action_workflow_details.explanation }}{% endif %}
+        </td>
+      </tr>
+      {% endif %}
       {% else %}
       <tr>
         <td colspan="9" class="muted-cell">조건에 맞는 청결도 결과가 없습니다.</td>
@@ -185,7 +203,12 @@
         <td>{{ row.analyzed_at }}</td>
         <td>{{ row.store_name }}</td>
         <td>{{ row.roi_name }}</td>
-        <td class="summary-cell">{{ row.summary }}</td>
+        <td class="summary-cell">
+          {{ row.summary }}
+          {% if row.action_workflow_details and row.action_workflow_details.explanation %}
+          <div class="muted-text">workflow: {{ row.action_workflow_details.explanation }}</div>
+          {% endif %}
+        </td>
       </tr>
       {% else %}
       <tr>
