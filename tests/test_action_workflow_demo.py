@@ -24,6 +24,17 @@ class FakePersonMaskService:
         return image, image.copy(), detections
 
 
+class FakeYoloHelper:
+    def __init__(self, detections_by_index: list[list[dict[str, object]]]) -> None:
+        self._detections_by_index = list(detections_by_index)
+        self.detected_paths: list[str] = []
+
+    def detect_objects(self, image_path: Path) -> list[dict[str, object]]:
+        self.detected_paths.append(image_path.name)
+        index = min(len(self.detected_paths) - 1, len(self._detections_by_index) - 1)
+        return list(self._detections_by_index[index])
+
+
 def demo_staff_zone_visits_json() -> str:
     return json.dumps(
         [
@@ -255,6 +266,76 @@ class ActionWorkflowDemoTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
 
+    def test_workflow_from_images_builds_visual_payloads_from_yolo(self) -> None:
+        client = TestClient(main_module.app)
+        original_person_mask_service = main_module.person_mask_service
+        original_yolo_helper = main_module.workflow_yolo_helper
+        main_module.person_mask_service = FakePersonMaskService([2, 0, 0])
+        fake_yolo_helper = FakeYoloHelper(
+            [
+                [{"label": "cup", "confidence": 0.91, "bbox": {"x1": 1, "y1": 1, "x2": 10, "y2": 10}}],
+                [{"label": "tray", "confidence": 0.82, "bbox": {"x1": 2, "y1": 2, "x2": 11, "y2": 11}}],
+                [{"label": "paper napkin", "confidence": 0.77, "bbox": {"x1": 3, "y1": 3, "x2": 12, "y2": 12}}],
+            ]
+        )
+        main_module.workflow_yolo_helper = fake_yolo_helper
+
+        try:
+            response = client.post(
+                "/api/action-cleanliness/workflow-from-images",
+                data={
+                    "store_id": "store_001",
+                    "table_id": "T06",
+                    "zone_id": "zone_B",
+                    "captured_at_start": "2026-06-03T14:10:20",
+                    "interval_seconds": "120",
+                    "visual_payload_source": "yolo",
+                    "staff_zone_visits_json": demo_staff_zone_visits_json(),
+                },
+                files=image_upload_files(),
+            )
+        finally:
+            main_module.person_mask_service = original_person_mask_service
+            main_module.workflow_yolo_helper = original_yolo_helper
+
+        payload = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["frames"][2]["payload"]["yolo_objects"][0]["label"], "napkin")
+        self.assertEqual(len(fake_yolo_helper.detected_paths), 3)
+
+    def test_workflow_from_images_keeps_json_path_working(self) -> None:
+        client = TestClient(main_module.app)
+        original_person_mask_service = main_module.person_mask_service
+        main_module.person_mask_service = FakePersonMaskService([2, 0, 0])
+
+        try:
+            response = client.post(
+                "/api/action-cleanliness/workflow-from-images",
+                data={
+                    "store_id": "store_001",
+                    "table_id": "T06",
+                    "zone_id": "zone_B",
+                    "captured_at_start": "2026-06-03T14:10:20",
+                    "interval_seconds": "120",
+                    "visual_payload_source": "json",
+                    "visual_payloads_json": json.dumps(
+                        [
+                            {"objects": [{"class": "cup", "confidence": 0.91}]},
+                            {"objects": [{"class": "cup", "confidence": 0.91}]},
+                            {"yolo_mess_score": 0.80, "detected_objects": [{"class": "trash", "count": 1, "max_confidence": 0.71}]},
+                        ]
+                    ),
+                },
+                files=image_upload_files(),
+            )
+        finally:
+            main_module.person_mask_service = original_person_mask_service
+
+        payload = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["frames"][2]["payload"]["yolo_mess_score"], 0.8)
+        self.assertIn("HIGH_YOLO_MESS_CAP_35", payload["applied_caps"])
+
     def test_workflow_from_video_returns_result(self) -> None:
         client = TestClient(main_module.app)
         original_person_mask_service = main_module.person_mask_service
@@ -289,6 +370,51 @@ class ActionWorkflowDemoTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(payload["frames"]), 3)
         self.assertEqual(payload["cleaning_status"], "CLEANED_LIKELY")
+
+    def test_workflow_from_video_builds_visual_payloads_from_yolo(self) -> None:
+        client = TestClient(main_module.app)
+        original_person_mask_service = main_module.person_mask_service
+        original_sampler = main_module.sample_video_workflow_frames
+        original_yolo_helper = main_module.workflow_yolo_helper
+        fake_yolo_helper = FakeYoloHelper(
+            [
+                [{"label": "cup", "confidence": 0.91, "bbox": {"x1": 1, "y1": 1, "x2": 8, "y2": 8}}],
+                [{"label": "tray", "confidence": 0.84, "bbox": {"x1": 2, "y1": 2, "x2": 9, "y2": 9}}],
+                [{"label": "spill", "confidence": 0.87, "bbox": {"x1": 3, "y1": 3, "x2": 10, "y2": 10}}],
+            ]
+        )
+        main_module.person_mask_service = FakePersonMaskService([2, 0, 0])
+        main_module.sample_video_workflow_frames = lambda *args, **kwargs: [
+            {"image": np.zeros((24, 24, 3), dtype=np.uint8), "offset_seconds": 0.0},
+            {"image": np.zeros((24, 24, 3), dtype=np.uint8), "offset_seconds": 120.0},
+            {"image": np.zeros((24, 24, 3), dtype=np.uint8), "offset_seconds": 240.0},
+        ]
+        main_module.workflow_yolo_helper = fake_yolo_helper
+
+        try:
+            response = client.post(
+                "/api/action-cleanliness/workflow-from-video",
+                data={
+                    "store_id": "store_001",
+                    "table_id": "T06",
+                    "zone_id": "zone_B",
+                    "captured_at_start": "2026-06-03T14:10:20",
+                    "interval_seconds": "120",
+                    "max_frames": "3",
+                    "visual_payload_source": "yolo",
+                    "staff_zone_visits_json": demo_staff_zone_visits_json(),
+                },
+                files={"video_file": ("demo.avi", b"fake-video", "video/x-msvideo")},
+            )
+        finally:
+            main_module.person_mask_service = original_person_mask_service
+            main_module.sample_video_workflow_frames = original_sampler
+            main_module.workflow_yolo_helper = original_yolo_helper
+
+        payload = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["frames"][2]["payload"]["visible_contamination"])
+        self.assertEqual(len(fake_yolo_helper.detected_paths), 3)
 
 
 if __name__ == "__main__":
