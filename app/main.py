@@ -27,7 +27,7 @@ from app.action_cleanliness import (
     parse_action_time_value,
     parse_trajectory_json,
 )
-from app.analysis import AnalysisService, read_image, save_analysis_crop
+from app.analysis import AnalysisService, read_image, save_analysis_crop, write_image
 from app.auth import create_access_token, hash_password, normalize_user_id, parse_access_token, validate_password, verify_password
 from app.cleanliness import (
     CLEANLINESS_IMAGE_EXTENSIONS,
@@ -35,7 +35,7 @@ from app.cleanliness import (
     CleanlinessService,
     normalize_cleanliness_prompt_profile,
 )
-from app.cleanliness_metric import normalize_visual_metric_input
+from app.cleanliness_metric import build_visual_payload_from_yolo_detections, normalize_visual_metric_input
 from app.config import (
     DATA_DIR,
     FRONTEND_DIR,
@@ -79,6 +79,7 @@ from app.vision_workflow_preprocessor import (
     build_workflow_frames_from_video,
     sample_video_workflow_frames,
 )
+from app.yolo_module import yolo_module
 
 
 app = FastAPI(title="MVP1 Franchise Quality Monitor")
@@ -99,6 +100,7 @@ person_mask_service = PersonMaskService()
 cleanliness_service = CleanlinessService()
 action_cleanliness_service = ActionCleanlinessService()
 video_cleanliness_service = VideoCleanlinessService()
+workflow_yolo_helper = yolo_module()
 
 init_db()
 
@@ -155,6 +157,10 @@ ACTION_WORKFLOW_DEMO_STAFF_VISITS_JSON = json.dumps(
     ensure_ascii=False,
     indent=2,
 )
+
+VISUAL_PAYLOAD_SOURCE_PRESET = "preset"
+VISUAL_PAYLOAD_SOURCE_JSON = "json"
+VISUAL_PAYLOAD_SOURCE_YOLO = "yolo"
 
 
 def current_owner_id(authorization: str | None = Header(default=None)) -> str:
@@ -754,6 +760,19 @@ def parse_staff_zone_visits_json(raw_value: str | None) -> list[dict[str, Any]]:
     return payload
 
 
+def normalize_visual_payload_source(raw_value: str | None, *, visual_payloads_json: str | None = None) -> str:
+    normalized = str(raw_value or "").strip().lower()
+    if not normalized:
+        return VISUAL_PAYLOAD_SOURCE_JSON if (visual_payloads_json or "").strip() else VISUAL_PAYLOAD_SOURCE_PRESET
+    if normalized in {
+        VISUAL_PAYLOAD_SOURCE_PRESET,
+        VISUAL_PAYLOAD_SOURCE_JSON,
+        VISUAL_PAYLOAD_SOURCE_YOLO,
+    }:
+        return normalized
+    raise HTTPException(status_code=400, detail="invalid visual_payload_source")
+
+
 def demo_visual_payload_template(name: str) -> tuple[dict[str, Any], dict[str, Any]]:
     before_payload = {
         "objects": [
@@ -785,11 +804,18 @@ def demo_visual_payload_template(name: str) -> tuple[dict[str, Any], dict[str, A
 def resolve_demo_visual_payloads(
     *,
     frame_count: int,
+    visual_payload_source: str | None,
     visual_payloads_json: str | None,
     preset: str | None,
 ) -> list[dict[str, Any]]:
-    payload = parse_demo_json_field(visual_payloads_json, "visual_payloads_json", default=None)
-    if payload is not None:
+    resolved_source = normalize_visual_payload_source(
+        visual_payload_source,
+        visual_payloads_json=visual_payloads_json,
+    )
+    if resolved_source == VISUAL_PAYLOAD_SOURCE_JSON:
+        payload = parse_demo_json_field(visual_payloads_json, "visual_payloads_json", default=None)
+        if payload is None:
+            raise HTTPException(status_code=400, detail="visual_payloads_json is required when visual_payload_source=json")
         if isinstance(payload, dict):
             return [dict(payload) for _ in range(frame_count)]
         if not isinstance(payload, list):
@@ -808,6 +834,48 @@ def resolve_demo_visual_payloads(
         return payloads
 
     return [{} for _ in range(frame_count)]
+
+
+def build_visual_payload_from_image_path_with_yolo(
+    image_path: Path,
+    *,
+    table_id: str,
+    yolo_helper: Any,
+) -> dict[str, Any]:
+    try:
+        detections = yolo_helper.detect_objects(image_path)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return build_visual_payload_from_yolo_detections(detections, table_id=table_id)
+
+
+def build_yolo_visual_payloads_from_image_paths(
+    image_paths: list[Path],
+    *,
+    table_id: str,
+    yolo_helper: Any,
+) -> list[dict[str, Any]]:
+    return [
+        build_visual_payload_from_image_path_with_yolo(path, table_id=table_id, yolo_helper=yolo_helper)
+        for path in image_paths
+    ]
+
+
+def build_yolo_visual_payloads_from_video_samples(
+    samples: list[dict[str, Any]],
+    *,
+    table_id: str,
+    temp_dir: Path,
+    yolo_helper: Any,
+) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for index, sample in enumerate(samples):
+        frame_path = temp_dir / f"workflow_video_frame_{index:02d}.png"
+        write_image(frame_path, sample["image"])
+        payloads.append(
+            build_visual_payload_from_image_path_with_yolo(frame_path, table_id=table_id, yolo_helper=yolo_helper)
+        )
+    return payloads
 
 
 def build_action_workflow_response(payload: ActionWorkflowRequest) -> dict[str, Any]:
@@ -1259,6 +1327,7 @@ def action_workflow_demo_page(request: Request) -> Any:
             "staff_zone_visits_json": ACTION_WORKFLOW_DEMO_STAFF_VISITS_JSON,
             "interaction_roi_json": "",
             "visual_payloads_json": "",
+            "selected_visual_payload_source": VISUAL_PAYLOAD_SOURCE_PRESET,
             "selected_preset": "cleaned_likely",
         },
     )
@@ -1357,6 +1426,7 @@ async def action_cleanliness_workflow_from_images(
     save_result: bool = Form(default=False),
     interaction_roi_json: str = Form(default=""),
     staff_zone_visits_json: str = Form(default=""),
+    visual_payload_source: str = Form(default=""),
     visual_payloads_json: str = Form(default=""),
     preset: str = Form(default=""),
     image_files: list[UploadFile] = File(...),
@@ -1368,10 +1438,9 @@ async def action_cleanliness_workflow_from_images(
 
     interaction_roi = parse_interaction_roi_json(interaction_roi_json)
     staff_zone_visits = parse_staff_zone_visits_json(staff_zone_visits_json)
-    payloads = resolve_demo_visual_payloads(
-        frame_count=len(image_files),
+    resolved_visual_payload_source = normalize_visual_payload_source(
+        visual_payload_source,
         visual_payloads_json=visual_payloads_json,
-        preset=preset,
     )
 
     with tempfile.TemporaryDirectory() as temp_dir_name:
@@ -1382,6 +1451,20 @@ async def action_cleanliness_workflow_from_images(
             if suffix not in IMAGE_EXTENSIONS:
                 raise HTTPException(status_code=400, detail="image files must be png, jpg, jpeg, bmp, or webp")
             image_paths.append(save_upload(image_file, temp_dir, f"workflow_image_{index:02d}"))
+
+        if resolved_visual_payload_source == VISUAL_PAYLOAD_SOURCE_YOLO:
+            payloads = build_yolo_visual_payloads_from_image_paths(
+                image_paths,
+                table_id=table_id,
+                yolo_helper=workflow_yolo_helper,
+            )
+        else:
+            payloads = resolve_demo_visual_payloads(
+                frame_count=len(image_files),
+                visual_payload_source=resolved_visual_payload_source,
+                visual_payloads_json=visual_payloads_json,
+                preset=preset,
+            )
 
         frames = build_workflow_frames_from_images(
             image_paths=image_paths,
@@ -1417,6 +1500,7 @@ async def action_cleanliness_workflow_from_video(
     save_result: bool = Form(default=False),
     interaction_roi_json: str = Form(default=""),
     staff_zone_visits_json: str = Form(default=""),
+    visual_payload_source: str = Form(default=""),
     visual_payloads_json: str = Form(default=""),
     preset: str = Form(default=""),
     video_file: UploadFile = File(...),
@@ -1431,6 +1515,10 @@ async def action_cleanliness_workflow_from_video(
 
     interaction_roi = parse_interaction_roi_json(interaction_roi_json)
     staff_zone_visits = parse_staff_zone_visits_json(staff_zone_visits_json)
+    resolved_visual_payload_source = normalize_visual_payload_source(
+        visual_payload_source,
+        visual_payloads_json=visual_payloads_json,
+    )
 
     with tempfile.TemporaryDirectory() as temp_dir_name:
         temp_dir = Path(temp_dir_name)
@@ -1440,11 +1528,20 @@ async def action_cleanliness_workflow_from_video(
             interval_seconds=interval_seconds,
             max_frames=max_frames,
         )
-        payloads = resolve_demo_visual_payloads(
-            frame_count=len(samples),
-            visual_payloads_json=visual_payloads_json,
-            preset=preset,
-        )
+        if resolved_visual_payload_source == VISUAL_PAYLOAD_SOURCE_YOLO:
+            payloads = build_yolo_visual_payloads_from_video_samples(
+                list(samples),
+                table_id=table_id,
+                temp_dir=temp_dir,
+                yolo_helper=workflow_yolo_helper,
+            )
+        else:
+            payloads = resolve_demo_visual_payloads(
+                frame_count=len(samples),
+                visual_payload_source=resolved_visual_payload_source,
+                visual_payloads_json=visual_payloads_json,
+                preset=preset,
+            )
         frames = build_workflow_frames_from_video(
             video_path=video_path,
             captured_at_start=captured_at_start,

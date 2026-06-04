@@ -4,6 +4,7 @@ import unittest
 
 from app.action_cleanliness import ActionWorkflowResult, YoloTableState
 from app.cleanliness_metric import (
+    build_visual_payload_from_yolo_detections,
     build_visual_metric_result,
     build_visual_metric_result_from_payload,
     canonical_object_class,
@@ -42,6 +43,61 @@ def build_action_result(action_score: float = 0.80) -> ActionWorkflowResult:
 
 
 class CleanlinessMetricTest(unittest.TestCase):
+    def test_fake_yolo_detections_are_converted_to_visual_metric_payload(self) -> None:
+        payload = build_visual_payload_from_yolo_detections(
+            [
+                {
+                    "label": "trash",
+                    "confidence": 0.81,
+                    "bbox": {"x1": 1, "y1": 2, "x2": 3, "y2": 4},
+                }
+            ],
+            table_id="T06",
+        )
+
+        self.assertEqual(payload["table_id"], "T06")
+        self.assertEqual(payload["yolo_objects"][0]["label"], "trash")
+        self.assertEqual(payload["yolo_objects"][0]["score"], 0.81)
+        self.assertEqual(payload["yolo_objects"][0]["bbox"]["x1"], 1)
+        self.assertEqual(payload["vision_confidence"], 0.81)
+
+    def test_paper_napkin_alias_is_applied(self) -> None:
+        payload = build_visual_payload_from_yolo_detections(
+            [{"label": "paper napkin", "confidence": 0.74, "bbox": {}}],
+            table_id="T06",
+        )
+
+        self.assertEqual(payload["yolo_objects"][0]["label"], "napkin")
+
+    def test_food_wrapper_alias_is_applied(self) -> None:
+        payload = build_visual_payload_from_yolo_detections(
+            [{"label": "food wrapper", "confidence": 0.72, "bbox": {}}],
+            table_id="T06",
+        )
+
+        self.assertEqual(payload["yolo_objects"][0]["label"], "wrapper")
+
+    def test_food_residue_alias_is_applied(self) -> None:
+        payload = build_visual_payload_from_yolo_detections(
+            [{"label": "crumbs", "confidence": 0.69, "bbox": {}}],
+            table_id="T06",
+        )
+
+        self.assertEqual(payload["yolo_objects"][0]["label"], "food_waste")
+
+    def test_stain_and_spill_are_reflected_as_visible_contamination(self) -> None:
+        payload = build_visual_payload_from_yolo_detections(
+            [
+                {"label": "stain", "confidence": 0.61, "bbox": {}},
+                {"label": "spill", "confidence": 0.66, "bbox": {}},
+            ],
+            table_id="T06",
+        )
+        result = build_visual_metric_result_from_payload(payload)
+
+        self.assertTrue(payload["visible_contamination"])
+        self.assertEqual(result.visual_score, 90)
+
     def test_existing_visual_metric_function_is_used_for_raw_payload(self) -> None:
         raw_payload = {
             "table_id": "T06",
@@ -236,6 +292,10 @@ class CleanlinessMetricTest(unittest.TestCase):
         self.assertEqual(canonical_object_class("plastic_cup"), "cup")
         self.assertEqual(canonical_object_class("plate"), "dish")
         self.assertEqual(canonical_object_class("leftover"), "food_waste")
+        self.assertEqual(canonical_object_class("paper napkin"), "napkin")
+        self.assertEqual(canonical_object_class("food wrapper"), "wrapper")
+        self.assertEqual(canonical_object_class("crumbs"), "food_waste")
+        self.assertEqual(canonical_object_class("metal tray"), "tray")
 
         result = build_visual_metric_result_from_payload(
             {

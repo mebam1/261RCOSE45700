@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 from app.action_cleanliness import CLUTTER_OBJECT_CLASSES, YoloTableState
 
@@ -14,17 +14,33 @@ OBJECT_CLASS_ALIASES = {
     "litter": "trash",
     "paper": "wrapper",
     "wrapper": "wrapper",
+    "food wrapper": "wrapper",
+    "snack wrapper": "wrapper",
+    "plastic wrapper": "wrapper",
     "tissue": "napkin",
     "napkin": "napkin",
+    "used tissue": "napkin",
+    "paper tissue": "napkin",
+    "crumpled tissue": "napkin",
+    "used napkin": "napkin",
+    "paper napkin": "napkin",
+    "crumpled napkin": "napkin",
     "plastic_cup": "cup",
     "cup": "cup",
     "plate": "dish",
     "dish": "dish",
+    "bowl": "dish",
+    "metal bowl": "dish",
     "tray": "tray",
+    "metal tray": "tray",
     "leftover": "food_waste",
     "food_residue": "food_waste",
+    "food residue": "food_waste",
+    "crumbs": "food_waste",
     "person": "person",
 }
+
+VISIBLE_CONTAMINATION_LABELS = {"stain", "spill"}
 
 
 @dataclass(frozen=True)
@@ -190,6 +206,42 @@ def build_visual_metric_result_from_payload(
     return build_visual_metric_result(normalize_visual_metric_input(payload, table_id=table_id))
 
 
+def build_visual_payload_from_yolo_detections(
+    detections: Sequence[Any],
+    *,
+    table_id: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "yolo_objects": [],
+    }
+    if table_id is not None:
+        payload["table_id"] = table_id
+
+    max_score: float | None = None
+    visible_contamination = False
+    for detection in detections:
+        raw_label, score, bbox = parse_yolo_detection(detection)
+        max_score = score if max_score is None else max(max_score, score)
+        normalized_label = canonical_object_class(raw_label)
+        if normalized_label is None:
+            if str(raw_label or "").strip().lower() in VISIBLE_CONTAMINATION_LABELS:
+                visible_contamination = True
+            continue
+        payload["yolo_objects"].append(
+            {
+                "label": normalized_label,
+                "score": score,
+                "bbox": bbox,
+            }
+        )
+
+    if max_score is not None:
+        payload["vision_confidence"] = max_score
+    if visible_contamination:
+        payload["visible_contamination"] = True
+    return payload
+
+
 def normalize_detected_objects(payload: dict[str, Any]) -> list[dict[str, Any]]:
     detected_objects = payload.get("detected_objects")
     if isinstance(detected_objects, list):
@@ -204,6 +256,19 @@ def normalize_detected_objects(payload: dict[str, Any]) -> list[dict[str, Any]]:
         return summarize_raw_objects(yolo_objects, label_key="label", confidence_key="score")
 
     return []
+
+
+def parse_yolo_detection(detection: Any) -> tuple[str, float, Any]:
+    if isinstance(detection, dict):
+        label = detection.get("label")
+        score = detection.get("score", detection.get("confidence", 0.0))
+        bbox = detection.get("bbox", {})
+        return str(label or "").strip(), clamp_confidence(score), bbox
+
+    label = getattr(detection, "label", "")
+    score = getattr(detection, "score", getattr(detection, "confidence", 0.0))
+    bbox = getattr(detection, "bbox", {})
+    return str(label or "").strip(), clamp_confidence(score), bbox
 
 
 def normalize_detected_object_summary(item: dict[str, Any]) -> dict[str, Any]:

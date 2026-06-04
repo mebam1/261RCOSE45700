@@ -42,6 +42,14 @@
         <textarea name="staff_zone_visits_json" rows="10">{{ staff_zone_visits_json }}</textarea>
       </label>
       <label>
+        <span>Visual Payload Source</span>
+        <select name="visual_payload_source">
+          {% for item in ["preset", "json", "yolo"] %}
+          <option value="{{ item }}" {% if selected_visual_payload_source == item %}selected{% endif %}>{{ item }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
         <span>Visual Payload Preset</span>
         <select name="preset">
           {% for item in ["cleaned_likely", "cleaning_unverified", "missed_suspected", "high_mess_cap"] %}
@@ -53,6 +61,7 @@
         <span>Visual Payloads JSON</span>
         <textarea name="visual_payloads_json" rows="10" placeholder='[{"objects":[{"class":"cup","confidence":0.91}]},{"objects":[]}]'>{{ visual_payloads_json }}</textarea>
       </label>
+      <p class="helper">Choose `yolo` to build frame payloads from uploaded images directly. In that mode, preset and JSON input can be left empty.</p>
       <label>
         <span>Images</span>
         <input type="file" name="image_files" accept=".png,.jpg,.jpeg,.bmp,.webp" multiple required>
@@ -103,6 +112,14 @@
         <textarea name="staff_zone_visits_json" rows="10">{{ staff_zone_visits_json }}</textarea>
       </label>
       <label>
+        <span>Visual Payload Source</span>
+        <select name="visual_payload_source">
+          {% for item in ["preset", "json", "yolo"] %}
+          <option value="{{ item }}" {% if selected_visual_payload_source == item %}selected{% endif %}>{{ item }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
         <span>Visual Payload Preset</span>
         <select name="preset">
           {% for item in ["cleaned_likely", "cleaning_unverified", "missed_suspected", "high_mess_cap"] %}
@@ -114,6 +131,7 @@
         <span>Visual Payloads JSON</span>
         <textarea name="visual_payloads_json" rows="10">{{ visual_payloads_json }}</textarea>
       </label>
+      <p class="helper">Choose `yolo` to run object detection on sampled video frames. In that mode, preset and JSON input can be left empty.</p>
       <label>
         <span>Video</span>
         <input type="file" name="video_file" accept=".mp4,.mov,.m4v,.avi,.webm,.mkv" required>
