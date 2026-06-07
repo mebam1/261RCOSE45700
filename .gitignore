@@ -12,5 +12,14 @@ data/person_masks/
 data/mvp1.sqlite3
 data/poster_templates/*_poster_*
 
+frontend/node_modules/
+frontend/dist/
+frontend/android/.gradle/
+frontend/android/build/
+frontend/android/app/build/
+frontend/android/captures/
+frontend/android/local.properties
+
 inference.sh
 mobileclip2_b.ts
+/frontend/dist/

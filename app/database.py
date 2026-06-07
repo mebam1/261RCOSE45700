@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterable
 from contextlib import closing
@@ -299,6 +300,29 @@ def fetch_cleanliness_results(filters: dict[str, str | None] | None = None) -> l
     with closing(get_connection()) as connection:
         rows = connection.execute(query, params).fetchall()
     return [dict(row) for row in rows]
+
+
+def fetch_cleanliness_result_by_job_id(job_id: str) -> dict[str, Any] | None:
+    with closing(get_connection()) as connection:
+        rows = connection.execute(
+            """
+            SELECT * FROM cleanliness_results
+            WHERE action_features LIKE :needle
+            ORDER BY id DESC
+            LIMIT 50
+            """,
+            {"needle": f"%{job_id}%"},
+        ).fetchall()
+
+    for row in rows:
+        record = dict(row)
+        try:
+            action_features = json.loads(record.get("action_features") or "{}")
+        except (TypeError, ValueError):
+            continue
+        if action_features.get("job_id") == job_id:
+            return record
+    return None
 
 
 def fetch_cleanliness_store_summary(filters: dict[str, str | None] | None = None) -> list[dict[str, Any]]:

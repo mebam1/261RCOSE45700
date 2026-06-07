@@ -44,6 +44,13 @@ def env_float(name: str, default: float) -> float:
     except ValueError:
         return default
 
+
+def env_csv(name: str) -> list[str]:
+    raw_value = env_text(name)
+    if not raw_value:
+        return []
+    return [item.strip() for item in raw_value.split(",") if item.strip()]
+
 DATA_DIR = BASE_DIR / "data"
 ROI_CONFIG_DIR = DATA_DIR / "roi_configs"
 REFERENCE_IMAGE_DIR = DATA_DIR / "reference_images"
@@ -69,6 +76,7 @@ OPENAI_MODEL = env_text("OPENAI_MODEL", "gpt-4.1-mini")
 AUTH_TOKEN_SECRET = env_text("AUTH_TOKEN_SECRET", "mvp1-local-dev-secret")
 AUTH_TOKEN_TTL_SECONDS = env_int("AUTH_TOKEN_TTL_SECONDS", 60 * 60 * 12)
 MOBILE_VIDEO_UPLOAD_INTERVAL_SECONDS = env_int("MOBILE_VIDEO_UPLOAD_INTERVAL_SECONDS", 60)
+MOBILE_CORS_EXTRA_ORIGINS = env_csv("MOBILE_CORS_EXTRA_ORIGINS")
 
 for path in (
     DATA_DIR,

@@ -83,7 +83,7 @@ class Mask2FormerPersonSegmenter:
                 from transformers import AutoImageProcessor, Mask2FormerForUniversalSegmentation
             except ImportError as exc:
                 raise RuntimeError(
-                    "Mask2Former person masking requires torch, torchvision, and transformers. "
+                    "Mask2Former person masking requires torch, torchvision, transformers, and scipy. "
                     "Install project dependencies with `pip install -r requirements.txt`."
                 ) from exc
 

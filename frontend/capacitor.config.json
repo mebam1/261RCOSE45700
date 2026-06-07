@@ -1,0 +1,9 @@
+{
+  "appId": "com.mvp1.cleanliness",
+  "appName": "Cleanliness Monitor",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "http",
+    "cleartext": true
+  }
+}
