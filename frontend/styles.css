@@ -353,6 +353,58 @@ video {
   grid-column: 1 / -1;
 }
 
+.toggle-row {
+  display: flex;
+  min-height: 48px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0 12px;
+  background: #fbfcf8;
+  cursor: pointer;
+}
+
+.toggle-row input[type="checkbox"] {
+  position: relative;
+  width: 48px;
+  min-height: 28px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0;
+  appearance: none;
+  background: #dfe6df;
+  transition: background-color 160ms ease, border-color 160ms ease;
+}
+
+.toggle-row input[type="checkbox"]::before {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(29, 37, 34, 0.24);
+  transition: transform 160ms ease;
+}
+
+.toggle-row input[type="checkbox"]:checked {
+  border-color: var(--green);
+  background: var(--green);
+}
+
+.toggle-row input[type="checkbox"]:checked::before {
+  transform: translateX(20px);
+}
+
+.toggle-row input[type="checkbox"]:focus-visible {
+  outline: 3px solid rgba(36, 99, 166, 0.25);
+  outline-offset: 2px;
+}
+
 .roi-summary {
   min-height: 44px;
   border: 1px solid var(--line);
@@ -369,6 +421,34 @@ video {
   grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
   gap: 16px;
   margin-top: 16px;
+}
+
+.warning-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 16px;
+  border: 1px solid #f0b3ad;
+  border-left: 6px solid var(--red);
+  border-radius: 8px;
+  padding: 14px;
+  background: #fff1ef;
+  color: var(--ink);
+}
+
+.warning-banner div {
+  display: grid;
+  gap: 4px;
+}
+
+.warning-banner strong {
+  color: var(--red);
+}
+
+.warning-banner span {
+  color: var(--ink);
+  line-height: 1.45;
 }
 
 .panel-head {
@@ -431,6 +511,7 @@ dd {
   min-height: 48px;
   color: var(--muted);
   line-height: 1.5;
+  white-space: pre-line;
 }
 
 .upload-panel {
@@ -480,6 +561,10 @@ dd {
 
 .upload-event.success {
   border-left-color: var(--green);
+}
+
+.upload-event.warning {
+  border-left-color: var(--red);
 }
 
 .upload-event.error {
@@ -542,6 +627,11 @@ dd {
 .upload-event.success .upload-status-chip {
   background: #e8f5ee;
   color: var(--green);
+}
+
+.upload-event.warning .upload-status-chip {
+  background: #ffe9e7;
+  color: var(--red);
 }
 
 .upload-event.error .upload-status-chip {

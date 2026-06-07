@@ -15,6 +15,7 @@ from app.cleanliness import (
     normalize_cleanliness_prompt_profile,
 )
 from app.config import OPENAI_MODEL
+from app.person_masking import PersonMaskService
 from app.schemas import CCTVConfig, ROI
 
 
@@ -47,6 +48,11 @@ class VideoCleanlinessResult:
     upload_period_seconds: float | None
     analysis_url: str
     raw_payload: dict[str, Any]
+    person_masking_enabled: bool = False
+    person_masking_applied: bool = False
+    person_count: int = 0
+    masked_pixel_ratio: float = 0.0
+    person_masked_path: Path | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -63,6 +69,11 @@ class VideoCleanlinessResult:
             "upload_period_seconds": self.upload_period_seconds,
             "analysis_url": self.analysis_url,
             "raw_payload": self.raw_payload,
+            "person_masking_enabled": self.person_masking_enabled,
+            "person_masking_applied": self.person_masking_applied,
+            "person_count": self.person_count,
+            "masked_pixel_ratio": round(self.masked_pixel_ratio, 4),
+            "person_masked_path": str(self.person_masked_path) if self.person_masked_path is not None else "",
         }
 
 
@@ -166,8 +177,13 @@ def parse_video_cleanliness_payload(payload: dict[str, Any]) -> VideoCleanliness
 
 
 class VideoCleanlinessService:
-    def __init__(self, client: VideoCleanlinessClient | None = None) -> None:
+    def __init__(
+        self,
+        client: VideoCleanlinessClient | None = None,
+        person_mask_service: PersonMaskService | None = None,
+    ) -> None:
         self.client = client or OpenAIVideoCleanlinessClient()
+        self.person_mask_service = person_mask_service
 
     def inspect_video(
         self,
@@ -179,6 +195,7 @@ class VideoCleanlinessService:
         device_id: str = "",
         captured_at: str = "",
         upload_period_seconds: float | None = None,
+        enable_person_masking: bool = False,
     ) -> VideoCleanlinessResult:
         if video_path.suffix.lower() not in VIDEO_CLEANLINESS_EXTENSIONS:
             raise ValueError("video file must be mp4, mov, m4v, avi, webm, or mkv")
@@ -195,10 +212,28 @@ class VideoCleanlinessService:
             "device_id": device_id,
             "captured_at": captured_at,
             "upload_period_seconds": upload_period_seconds,
+            "person_masking_enabled": enable_person_masking,
+            "person_masking_applied": False,
+            "person_count": 0,
+            "masked_pixel_ratio": 0.0,
         }
         contact_sheet_path = build_cropped_video_contact_sheet_file(video_path, roi)
+        analysis_image_path = contact_sheet_path
+        mask_result = None
         try:
-            assessment = self.client.analyze_video(contact_sheet_path, metadata)
+            if enable_person_masking:
+                mask_service = self.person_mask_service or PersonMaskService()
+                mask_result = mask_service.mask_image_file(contact_sheet_path, output_stem=contact_sheet_path.stem)
+                analysis_image_path = mask_result.masked_path
+                metadata.update(
+                    {
+                        "person_masking_applied": True,
+                        "person_count": mask_result.person_count,
+                        "masked_pixel_ratio": mask_result.masked_pixel_ratio,
+                    }
+                )
+
+            assessment = self.client.analyze_video(analysis_image_path, metadata)
         finally:
             contact_sheet_path.unlink(missing_ok=True)
         return VideoCleanlinessResult(
@@ -215,4 +250,9 @@ class VideoCleanlinessService:
             upload_period_seconds=upload_period_seconds,
             analysis_url=self.client.analysis_url,
             raw_payload=assessment.raw_payload,
+            person_masking_enabled=enable_person_masking,
+            person_masking_applied=mask_result is not None,
+            person_count=mask_result.person_count if mask_result is not None else 0,
+            masked_pixel_ratio=mask_result.masked_pixel_ratio if mask_result is not None else 0.0,
+            person_masked_path=mask_result.masked_path if mask_result is not None else None,
         )

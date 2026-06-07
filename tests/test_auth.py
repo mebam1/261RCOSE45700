@@ -67,6 +67,33 @@ class AuthTest(unittest.TestCase):
         )
         self.assertEqual(authenticated.status_code, 200)
 
+    def test_owner_auth_cors_allows_mobile_and_local_origins(self) -> None:
+        client = TestClient(main_module.app)
+        origins = [
+            "capacitor://localhost",
+            "http://localhost",
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://192.168.0.10:8080",
+        ]
+
+        for origin in origins:
+            with self.subTest(origin=origin):
+                status = client.get("/api/auth/status", headers={"Origin": origin})
+                self.assertEqual(status.status_code, 200)
+                self.assertEqual(status.headers.get("access-control-allow-origin"), origin)
+
+                preflight = client.options(
+                    "/api/auth/login",
+                    headers={
+                        "Origin": origin,
+                        "Access-Control-Request-Method": "POST",
+                        "Access-Control-Request-Headers": "content-type",
+                    },
+                )
+                self.assertEqual(preflight.status_code, 200)
+                self.assertEqual(preflight.headers.get("access-control-allow-origin"), origin)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,7 @@ from fastapi.testclient import TestClient
 import app.main as main_module
 from app.cleanliness import PROMPT_PROFILE_RESTAURANT
 from app.database import clear_cleanliness_results, clear_owner_accounts, fetch_cleanliness_results, init_db
+from app.person_masking import PersonMaskResult
 from app.roi_store import ConfigStore
 from app.video_cleanliness import VideoCleanlinessAssessment, VideoCleanlinessResult, VideoCleanlinessService, parse_video_cleanliness_payload
 from scripts.generate_test_data import generate_test_data
@@ -25,6 +27,7 @@ class FakeVideoCleanlinessService:
         self.device_id: str | None = None
         self.captured_at: str | None = None
         self.upload_period_seconds: float | None = None
+        self.enable_person_masking: bool | None = None
 
     def inspect_video(
         self,
@@ -36,6 +39,7 @@ class FakeVideoCleanlinessService:
         device_id: str = "",
         captured_at: str = "",
         upload_period_seconds: float | None = None,
+        enable_person_masking: bool = False,
     ) -> VideoCleanlinessResult:
         self.config_id = config.config_id
         self.roi_name = roi.name
@@ -44,6 +48,7 @@ class FakeVideoCleanlinessService:
         self.device_id = device_id
         self.captured_at = captured_at
         self.upload_period_seconds = upload_period_seconds
+        self.enable_person_masking = enable_person_masking
         return VideoCleanlinessResult(
             source_path=video_path,
             score=2,
@@ -58,12 +63,17 @@ class FakeVideoCleanlinessService:
             upload_period_seconds=upload_period_seconds,
             analysis_url="https://analysis.example.test/cleanliness/video",
             raw_payload={"score": 2, "confidence": 0.81},
+            person_masking_enabled=enable_person_masking,
+            person_masking_applied=enable_person_masking,
+            person_count=1 if enable_person_masking else 0,
+            masked_pixel_ratio=0.13 if enable_person_masking else 0.0,
         )
 
 
 class FailingVideoCleanlinessService:
     def __init__(self) -> None:
         self.video_path: Path | None = None
+        self.enable_person_masking: bool | None = None
 
     def inspect_video(
         self,
@@ -75,8 +85,10 @@ class FailingVideoCleanlinessService:
         device_id: str = "",
         captured_at: str = "",
         upload_period_seconds: float | None = None,
+        enable_person_masking: bool = False,
     ) -> VideoCleanlinessResult:
         self.video_path = video_path
+        self.enable_person_masking = enable_person_masking
         raise RuntimeError("analysis service unavailable")
 
 
@@ -110,6 +122,28 @@ class FakeOpenAIVideoClient:
             raise AssertionError("contact sheet must exist while OpenAI client is called")
         if self.contact_sheet_path.suffix.lower() != ".png":
             raise AssertionError("contact sheet must be a PNG image")
+
+
+class FakeContactSheetPersonMaskService:
+    def __init__(self) -> None:
+        self.source_path: Path | None = None
+        self.masked_path: Path | None = None
+
+    def mask_image_file(self, source_path: Path, output_stem: str | None = None) -> PersonMaskResult:
+        self.source_path = source_path
+        if not source_path.exists():
+            raise AssertionError("contact sheet must exist while person masking is called")
+
+        stem = output_stem or source_path.stem
+        self.masked_path = source_path.with_name(f"{stem}_masked_for_test.png")
+        shutil.copyfile(source_path, self.masked_path)
+        return PersonMaskResult(
+            source_path=source_path,
+            masked_path=self.masked_path,
+            person_count=2,
+            masked_pixel_ratio=0.125,
+            detections=[],
+        )
 
 
 class MobileVideoCleanlinessTest(unittest.TestCase):
@@ -150,6 +184,7 @@ class MobileVideoCleanlinessTest(unittest.TestCase):
                         "device_id": "phone-01",
                         "captured_at": "2026-05-27T12:30:00+09:00",
                         "upload_period_seconds": "30",
+                        "enable_person_masking": "true",
                     },
                     files={"video_file": ("storealpha_present.avi", handle, "video/x-msvideo")},
                 )
@@ -165,6 +200,7 @@ class MobileVideoCleanlinessTest(unittest.TestCase):
             self.assertEqual(fake_service.device_id, "phone-01")
             self.assertEqual(fake_service.captured_at, "2026-05-27T12:30:00+09:00")
             self.assertEqual(fake_service.upload_period_seconds, 30.0)
+            self.assertTrue(fake_service.enable_person_masking)
             self.assertIsNotNone(fake_service.video_path)
             assert fake_service.video_path is not None
             self.assertTrue(fake_service.video_path.exists())
@@ -179,6 +215,20 @@ class MobileVideoCleanlinessTest(unittest.TestCase):
             self.assertEqual(action_features["job_id"], payload["job_id"])
             self.assertEqual(action_features["device_id"], "phone-01")
             self.assertEqual(action_features["upload_period_seconds"], 30.0)
+            self.assertTrue(action_features["person_masking_enabled"])
+            self.assertTrue(action_features["person_masking_applied"])
+            self.assertEqual(action_features["person_count"], 1)
+
+            job_response = client.get(f"/api/mobile/jobs/{payload['job_id']}", headers=headers)
+            self.assertEqual(job_response.status_code, 200)
+            job_payload = job_response.json()
+            self.assertEqual(job_payload["status"], "completed")
+            self.assertEqual(job_payload["score"], 2)
+            self.assertTrue(job_payload["is_low_score"])
+            self.assertEqual(job_payload["low_score_threshold"], 2)
+            self.assertTrue(job_payload["person_masking_enabled"])
+            self.assertTrue(job_payload["person_masking_applied"])
+            self.assertEqual(job_payload["person_count"], 1)
         finally:
             if fake_service.video_path is not None:
                 fake_service.video_path.unlink(missing_ok=True)
@@ -204,6 +254,7 @@ class MobileVideoCleanlinessTest(unittest.TestCase):
                         "device_id": "phone-02",
                         "captured_at": "2026-05-27T12:45:00+09:00",
                         "upload_period_seconds": "30",
+                        "enable_person_masking": "true",
                     },
                     files={"video_file": ("storealpha_present.avi", handle, "video/x-msvideo")},
                 )
@@ -222,7 +273,16 @@ class MobileVideoCleanlinessTest(unittest.TestCase):
             action_features = json.loads(records[0]["action_features"])
             self.assertEqual(action_features["job_id"], payload["job_id"])
             self.assertEqual(action_features["device_id"], "phone-02")
+            self.assertTrue(action_features["person_masking_enabled"])
             self.assertEqual(action_features["error"], "analysis service unavailable")
+
+            job_response = client.get(f"/api/mobile/jobs/{payload['job_id']}", headers=headers)
+            self.assertEqual(job_response.status_code, 200)
+            job_payload = job_response.json()
+            self.assertEqual(job_payload["status"], "failed")
+            self.assertIsNone(job_payload["score"])
+            self.assertFalse(job_payload["is_low_score"])
+            self.assertTrue(job_payload["person_masking_enabled"])
         finally:
             if fake_service.video_path is not None:
                 fake_service.video_path.unlink(missing_ok=True)
@@ -255,6 +315,37 @@ class MobileVideoCleanlinessTest(unittest.TestCase):
         self.assertIsNotNone(fake_client.contact_sheet_path)
         assert fake_client.contact_sheet_path is not None
         self.assertFalse(fake_client.contact_sheet_path.exists())
+
+    def test_video_cleanliness_service_masks_contact_sheet_when_enabled(self) -> None:
+        fake_client = FakeOpenAIVideoClient()
+        fake_mask_service = FakeContactSheetPersonMaskService()
+        service = VideoCleanlinessService(fake_client, person_mask_service=fake_mask_service)
+        config = main_module.config_store.load("StoreAlpha_FrontCam")
+        roi = main_module.config_store.get_roi("StoreAlpha_FrontCam", "POP")
+
+        result = service.inspect_video(
+            config=config,
+            roi=roi,
+            video_path=Path("data/test_data/storealpha_present.avi"),
+            prompt_profile="restaurant",
+            device_id="phone-04",
+            captured_at="2026-05-27T13:05:00+09:00",
+            upload_period_seconds=30,
+            enable_person_masking=True,
+        )
+
+        self.assertTrue(result.person_masking_enabled)
+        self.assertTrue(result.person_masking_applied)
+        self.assertEqual(result.person_count, 2)
+        self.assertAlmostEqual(result.masked_pixel_ratio, 0.125)
+        self.assertEqual(fake_client.contact_sheet_path, fake_mask_service.masked_path)
+        self.assertIsNotNone(fake_mask_service.source_path)
+        assert fake_mask_service.source_path is not None
+        self.assertFalse(fake_mask_service.source_path.exists())
+        self.assertIsNotNone(fake_mask_service.masked_path)
+        assert fake_mask_service.masked_path is not None
+        self.assertTrue(fake_mask_service.masked_path.exists())
+        fake_mask_service.masked_path.unlink(missing_ok=True)
 
     def test_video_analysis_payload_accepts_nested_cleanliness_score(self) -> None:
         assessment = parse_video_cleanliness_payload(

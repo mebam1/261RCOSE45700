@@ -12,6 +12,10 @@
         <p class="eyebrow">Store Owner</p>
         <h1 id="auth-title">로그인</h1>
         <label>
+          <span>서버 주소</span>
+          <input id="auth-backend-base-input" type="url" autocomplete="off">
+        </label>
+        <label>
           <span>아이디</span>
           <input id="auth-user-id-input" type="text" autocomplete="username" required>
         </label>
@@ -113,6 +117,11 @@
                 <option value="general">일반</option>
               </select>
             </label>
+
+            <label class="toggle-row full-width">
+              <span>사람 마스킹</span>
+              <input id="person-mask-input" type="checkbox">
+            </label>
           </form>
 
           <form class="control-grid tab-panel" id="roi-form">
@@ -140,6 +149,14 @@
             </div>
           </form>
         </aside>
+      </section>
+
+      <section class="warning-banner hidden" id="low-score-alert">
+        <div>
+          <strong>청결도 경고</strong>
+          <span id="low-score-message">낮은 청결도 점수가 감지되었습니다.</span>
+        </div>
+        <button class="ghost-button" id="dismiss-low-score-button" type="button">닫기</button>
       </section>
 
       <section class="result-layout">
@@ -196,6 +213,7 @@
       </section>
     </main>
 
+    <script src="./app-config.js"></script>
     <script src="./app.js" defer></script>
   </body>
 </html>
