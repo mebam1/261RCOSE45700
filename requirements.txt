@@ -7,5 +7,6 @@ Pillow
 torch
 torchvision
 transformers
+ultralytics
 openai
 python-dotenv

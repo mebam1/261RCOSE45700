@@ -11,3 +11,6 @@ data/analysis_crops/
 data/person_masks/
 data/mvp1.sqlite3
 data/poster_templates/*_poster_*
+
+inference.sh
+mobileclip2_b.ts
