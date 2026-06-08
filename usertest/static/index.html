@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Table Cleanliness User Test</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <div>
+        <p class="eyebrow">User Test</p>
+        <h1>테이블 청결도 평가</h1>
+        <p class="lede">
+          왼쪽의 깨끗한 기준 사진과 오른쪽의 생성 사진을 비교하고,
+          오른쪽 사진의 청결도를 1~5점으로 평가하세요.
+        </p>
+      </div>
+      <div class="session-card">
+        <label for="participantId">참가자 ID</label>
+        <input id="participantId" type="text" autocomplete="off" placeholder="예: user-01">
+        <button id="startButton" class="primary">테스트 시작</button>
+      </div>
+    </section>
+
+    <section id="testPanel" class="panel hidden" aria-live="polite">
+      <header class="panel-header">
+        <div>
+          <p id="progressText" class="eyebrow">0 / 0</p>
+          <h2 id="trialTitle">이미지 평가</h2>
+        </div>
+        <div class="progress-track" aria-hidden="true">
+          <div id="progressFill" class="progress-fill"></div>
+        </div>
+      </header>
+
+      <div class="image-grid">
+        <figure>
+          <figcaption>청결한 기준 사진</figcaption>
+          <img id="cleanImage" alt="청결한 기준 테이블 이미지">
+        </figure>
+        <figure class="target">
+          <figcaption>평가할 생성 사진</figcaption>
+          <img id="dirtyImage" alt="평가 대상 생성 테이블 이미지">
+        </figure>
+      </div>
+
+      <form id="ratingForm" class="rating-card">
+        <fieldset>
+          <legend>오른쪽 사진의 청결도</legend>
+          <div class="score-row" role="radiogroup" aria-label="청결도 점수">
+            <button type="button" class="score-button" data-score="1">1<span>매우 더러움</span></button>
+            <button type="button" class="score-button" data-score="2">2<span>더러움</span></button>
+            <button type="button" class="score-button" data-score="3">3<span>보통</span></button>
+            <button type="button" class="score-button" data-score="4">4<span>깨끗함</span></button>
+            <button type="button" class="score-button" data-score="5">5<span>매우 깨끗함</span></button>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>청소 여부</legend>
+          <div class="need-row">
+            <button type="button" class="need-button" data-needed="true">청소 필요</button>
+            <button type="button" class="need-button" data-needed="false">청소 불필요</button>
+          </div>
+        </fieldset>
+
+        <div class="actions">
+          <p id="statusText" class="status">점수와 청소 여부를 선택하세요.</p>
+          <button id="submitButton" type="submit" class="primary" disabled>저장 후 다음</button>
+        </div>
+      </form>
+    </section>
+
+    <section id="donePanel" class="panel hidden">
+      <p class="eyebrow">Completed</p>
+      <h2>평가가 완료되었습니다.</h2>
+      <p>응답은 서버의 <code>usertest/responses/responses.jsonl</code>에 저장됩니다.</p>
+      <div class="actions">
+        <button id="restartButton" class="secondary">처음부터 다시 보기</button>
+        <button id="summaryButton" class="primary">분석 요약 보기</button>
+      </div>
+    </section>
+
+    <section id="summaryPanel" class="panel hidden">
+      <header class="panel-header">
+        <div>
+          <p class="eyebrow">Analysis</p>
+          <h2>응답 요약</h2>
+        </div>
+        <a class="download-link" href="/api/export.csv" target="_blank" rel="noreferrer">CSV 다운로드</a>
+      </header>
+      <div id="thresholdBox" class="threshold-box"></div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>이미지</th>
+              <th>응답 수</th>
+              <th>Median</th>
+              <th>Stddev</th>
+              <th>청소 필요 비율</th>
+            </tr>
+          </thead>
+          <tbody id="summaryBody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
