@@ -23,3 +23,8 @@ frontend/android/local.properties
 inference.sh
 mobileclip2_b.ts
 /frontend/dist/
+
+# Dongwoo VLM classifier
+venv/
+**/venv/
+**/.env
