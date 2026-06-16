@@ -27,7 +27,7 @@ from app.action_cleanliness import (
     parse_action_time_value,
     parse_trajectory_json,
 )
-from app.analysis import AnalysisService, read_image, save_analysis_crop, write_image
+from app.analysis import AnalysisService, image_data_url, read_image, save_analysis_crop, write_image
 from app.auth import create_access_token, hash_password, normalize_user_id, parse_access_token, validate_password, verify_password
 from app.cleanliness import (
     CLEANLINESS_IMAGE_EXTENSIONS,
@@ -75,8 +75,11 @@ from app.schemas import (
 )
 from app.video_cleanliness import VIDEO_CLEANLINESS_EXTENSIONS, VideoCleanlinessService
 from app.vision_workflow_preprocessor import (
+    DynamicVideoSamplingConfig,
     build_workflow_frames_from_images,
     build_workflow_frames_from_video,
+    captured_at_for_video_frame,
+    sample_dynamic_video_workflow_frames,
     sample_video_workflow_frames,
 )
 from app.yolo_module import yolo_module
@@ -421,6 +424,54 @@ def analyze_page(request: Request, config_id: str | None = Query(default=None)) 
 
 def data_url(path: Path) -> str:
     return "/data/" + path.relative_to(DATA_DIR).as_posix()
+
+
+def workflow_video_sampling_config(interval_seconds: float, max_frames: int) -> DynamicVideoSamplingConfig:
+    return DynamicVideoSamplingConfig(
+        idle_interval_seconds=max(interval_seconds, 1.0),
+        occupied_interval_seconds=max(1.0, min(interval_seconds, 5.0)),
+        transition_interval_seconds=max(0.5, min(interval_seconds / 2.0, 2.0)),
+        post_check_interval_seconds=max(1.0, min(interval_seconds / 2.0, 3.0)),
+        max_observations=max(max_frames * 6, 24),
+    )
+
+
+def serialize_dynamic_video_candidate(
+    sample: dict[str, Any],
+    *,
+    captured_at_start: str,
+) -> dict[str, Any]:
+    serialized = {
+        "timestamp_sec": round(float(sample.get("offset_seconds", 0.0)), 2),
+        "captured_at": captured_at_for_video_frame(
+            captured_at_start=captured_at_start,
+            frame_index=sample.get("frame_index"),
+            fps=sample.get("fps"),
+            interval_seconds=max(float(sample.get("offset_seconds", 0.0)), 1.0),
+            sample_index=0,
+            offset_seconds=sample.get("offset_seconds"),
+        ),
+        "frame_type": sample.get("frame_type"),
+        "sampling_state": sample.get("sampling_state"),
+        "priority": sample.get("priority"),
+        "reason_codes": list(sample.get("reason_codes", [])),
+        "features": dict(sample.get("features", {})),
+    }
+    crop_image = sample.get("crop_image")
+    if crop_image is not None:
+        serialized["preview_url"] = image_data_url(crop_image)
+    return serialized
+
+
+def sampler_metadata_payload(sample: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "sampler_frame_type": sample.get("frame_type"),
+        "sampler_reason_codes": list(sample.get("reason_codes", [])),
+        "sampler_priority": sample.get("priority"),
+        "sampler_state": sample.get("sampling_state"),
+        "sampler_features": dict(sample.get("features", {})),
+        "sampler_timestamp_sec": round(float(sample.get("offset_seconds", 0.0)), 2),
+    }
 
 
 def dump_json(value: Any) -> str:
@@ -1324,6 +1375,7 @@ def action_workflow_demo_page(request: Request) -> Any:
             "table_id": "T06",
             "zone_id": "zone_B",
             "save_result": False,
+            "dynamic_sampling": True,
             "staff_zone_visits_json": ACTION_WORKFLOW_DEMO_STAFF_VISITS_JSON,
             "interaction_roi_json": "",
             "visual_payloads_json": "",
@@ -1416,6 +1468,48 @@ async def action_cleanliness_workflow_api(payload: ActionWorkflowRequest) -> JSO
     return JSONResponse(build_action_workflow_response(payload))
 
 
+@app.post("/api/action-cleanliness/workflow-video-candidates")
+async def action_cleanliness_workflow_video_candidates(
+    table_id: str = Form(...),
+    captured_at_start: str = Form(...),
+    interval_seconds: float = Form(default=10.0),
+    max_frames: int = Form(default=10),
+    interaction_roi_json: str = Form(default=""),
+    video_file: UploadFile = File(...),
+) -> JSONResponse:
+    suffix = Path(video_file.filename or "").suffix.lower()
+    if suffix not in VIDEO_CLEANLINESS_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="video file must be mp4, mov, m4v, avi, webm, or mkv")
+    if interval_seconds <= 0:
+        raise HTTPException(status_code=400, detail="interval_seconds must be greater than 0")
+    if max_frames <= 0:
+        raise HTTPException(status_code=400, detail="max_frames must be greater than 0")
+
+    interaction_roi = parse_interaction_roi_json(interaction_roi_json)
+    with tempfile.TemporaryDirectory() as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+        video_path = save_upload(video_file, temp_dir, "workflow_video_candidates")
+        samples = sample_dynamic_video_workflow_frames(
+            video_path=video_path,
+            max_frames=max_frames,
+            interaction_roi=interaction_roi,
+            person_mask_service=person_mask_service,
+            sampling_config=workflow_video_sampling_config(interval_seconds, max_frames),
+        )
+
+    return JSONResponse(
+        {
+            "table_id": table_id,
+            "candidate_count": len(samples),
+            "dynamic_sampling": True,
+            "candidates": [
+                serialize_dynamic_video_candidate(sample, captured_at_start=captured_at_start)
+                for sample in samples
+            ],
+        }
+    )
+
+
 @app.post("/api/action-cleanliness/workflow-from-images")
 async def action_cleanliness_workflow_from_images(
     store_id: str = Form(...),
@@ -1497,6 +1591,7 @@ async def action_cleanliness_workflow_from_video(
     captured_at_start: str = Form(...),
     interval_seconds: float = Form(default=30.0),
     max_frames: int = Form(default=10),
+    dynamic_sampling: bool = Form(default=False),
     save_result: bool = Form(default=False),
     interaction_roi_json: str = Form(default=""),
     staff_zone_visits_json: str = Form(default=""),
@@ -1523,11 +1618,20 @@ async def action_cleanliness_workflow_from_video(
     with tempfile.TemporaryDirectory() as temp_dir_name:
         temp_dir = Path(temp_dir_name)
         video_path = save_upload(video_file, temp_dir, "workflow_video")
-        samples = sample_video_workflow_frames(
-            video_path=video_path,
-            interval_seconds=interval_seconds,
-            max_frames=max_frames,
-        )
+        if dynamic_sampling:
+            samples = sample_dynamic_video_workflow_frames(
+                video_path=video_path,
+                max_frames=max_frames,
+                interaction_roi=interaction_roi,
+                person_mask_service=person_mask_service,
+                sampling_config=workflow_video_sampling_config(interval_seconds, max_frames),
+            )
+        else:
+            samples = sample_video_workflow_frames(
+                video_path=video_path,
+                interval_seconds=interval_seconds,
+                max_frames=max_frames,
+            )
         if resolved_visual_payload_source == VISUAL_PAYLOAD_SOURCE_YOLO:
             payloads = build_yolo_visual_payloads_from_video_samples(
                 list(samples),
@@ -1549,7 +1653,10 @@ async def action_cleanliness_workflow_from_video(
             max_frames=max_frames,
             table_id=table_id,
             interaction_roi=interaction_roi,
-            payload_builder=lambda _image, index, **_: payloads[index],
+            payload_builder=lambda _image, index, **_: {
+                **payloads[index],
+                **(sampler_metadata_payload(samples[index]) if dynamic_sampling else {}),
+            },
             person_mask_service=person_mask_service,
             frame_extractor=lambda _path, **__: list(samples),
         )
@@ -1564,7 +1671,15 @@ async def action_cleanliness_workflow_from_video(
         frames=frames,
         staff_zone_visits=staff_zone_visits,
     )
-    return JSONResponse(build_action_workflow_response(payload))
+    response_payload = build_action_workflow_response(payload)
+    if dynamic_sampling:
+        response_payload["dynamic_sampling"] = True
+        response_payload["candidate_count"] = len(samples)
+        response_payload["candidate_summary"] = [
+            serialize_dynamic_video_candidate(sample, captured_at_start=captured_at_start)
+            for sample in samples
+        ]
+    return JSONResponse(response_payload)
 
 
 @app.get("/hybrid-cleanliness")
