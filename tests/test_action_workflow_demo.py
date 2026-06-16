@@ -371,6 +371,118 @@ class ActionWorkflowDemoTest(unittest.TestCase):
         self.assertEqual(len(payload["frames"]), 3)
         self.assertEqual(payload["cleaning_status"], "CLEANED_LIKELY")
 
+    def test_workflow_video_candidates_returns_preview_metadata(self) -> None:
+        client = TestClient(main_module.app)
+        original_sampler = main_module.sample_dynamic_video_workflow_frames
+        main_module.sample_dynamic_video_workflow_frames = lambda *args, **kwargs: [
+            {
+                "image": np.zeros((24, 24, 3), dtype=np.uint8),
+                "crop_image": np.zeros((16, 16, 3), dtype=np.uint8),
+                "offset_seconds": 0.0,
+                "frame_type": "periodic_sample",
+                "sampling_state": "idle",
+                "priority": 0.15,
+                "reason_codes": ["periodic_sample"],
+                "features": {"change_score": 0.0, "person_present": False, "person_count": 0},
+            },
+            {
+                "image": np.full((24, 24, 3), 255, dtype=np.uint8),
+                "crop_image": np.full((16, 16, 3), 255, dtype=np.uint8),
+                "offset_seconds": 12.0,
+                "frame_type": "meal_end_candidate",
+                "sampling_state": "meal_end_candidate",
+                "priority": 0.83,
+                "reason_codes": ["person_left"],
+                "features": {"change_score": 0.22, "person_present": False, "person_count": 0},
+            },
+        ]
+
+        try:
+            response = client.post(
+                "/api/action-cleanliness/workflow-video-candidates",
+                data={
+                    "table_id": "T06",
+                    "captured_at_start": "2026-06-03T14:10:20",
+                    "interval_seconds": "10",
+                    "max_frames": "2",
+                },
+                files={"video_file": ("demo.avi", b"fake-video", "video/x-msvideo")},
+            )
+        finally:
+            main_module.sample_dynamic_video_workflow_frames = original_sampler
+
+        payload = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["candidate_count"], 2)
+        self.assertEqual(payload["candidates"][1]["frame_type"], "meal_end_candidate")
+        self.assertTrue(payload["candidates"][1]["preview_url"].startswith("data:image/"))
+
+    def test_workflow_from_video_dynamic_sampling_includes_candidate_summary(self) -> None:
+        client = TestClient(main_module.app)
+        original_person_mask_service = main_module.person_mask_service
+        original_sampler = main_module.sample_dynamic_video_workflow_frames
+        main_module.person_mask_service = FakePersonMaskService([2, 0, 0])
+        main_module.sample_dynamic_video_workflow_frames = lambda *args, **kwargs: [
+            {
+                "image": np.zeros((24, 24, 3), dtype=np.uint8),
+                "crop_image": np.zeros((16, 16, 3), dtype=np.uint8),
+                "offset_seconds": 0.0,
+                "frame_type": "occupied_representative",
+                "sampling_state": "occupied",
+                "priority": 0.42,
+                "reason_codes": ["person_present"],
+                "features": {"change_score": 0.0, "person_present": True, "person_count": 2},
+            },
+            {
+                "image": np.zeros((24, 24, 3), dtype=np.uint8),
+                "crop_image": np.zeros((16, 16, 3), dtype=np.uint8),
+                "offset_seconds": 120.0,
+                "frame_type": "meal_end_candidate",
+                "sampling_state": "meal_end_candidate",
+                "priority": 0.81,
+                "reason_codes": ["person_left"],
+                "features": {"change_score": 0.12, "person_present": False, "person_count": 0},
+            },
+            {
+                "image": np.zeros((24, 24, 3), dtype=np.uint8),
+                "crop_image": np.zeros((16, 16, 3), dtype=np.uint8),
+                "offset_seconds": 240.0,
+                "frame_type": "post_check",
+                "sampling_state": "post_check",
+                "priority": 0.76,
+                "reason_codes": ["post_check_stable"],
+                "features": {"change_score": 0.02, "person_present": False, "person_count": 0},
+            },
+        ]
+
+        try:
+            response = client.post(
+                "/api/action-cleanliness/workflow-from-video",
+                data={
+                    "store_id": "store_001",
+                    "table_id": "T06",
+                    "zone_id": "zone_B",
+                    "captured_at_start": "2026-06-03T14:10:20",
+                    "interval_seconds": "120",
+                    "max_frames": "3",
+                    "dynamic_sampling": "true",
+                    "preset": "cleaned_likely",
+                    "staff_zone_visits_json": demo_staff_zone_visits_json(),
+                },
+                files={"video_file": ("demo.avi", b"fake-video", "video/x-msvideo")},
+            )
+        finally:
+            main_module.person_mask_service = original_person_mask_service
+            main_module.sample_dynamic_video_workflow_frames = original_sampler
+
+        payload = response.json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["dynamic_sampling"])
+        self.assertEqual(payload["candidate_count"], 3)
+        self.assertEqual(payload["candidate_summary"][1]["frame_type"], "meal_end_candidate")
+        self.assertEqual(payload["frames"][1]["payload"]["sampler_frame_type"], "meal_end_candidate")
+        self.assertEqual(payload["frames"][2]["payload"]["sampler_reason_codes"], ["post_check_stable"])
+
     def test_workflow_from_video_builds_visual_payloads_from_yolo(self) -> None:
         client = TestClient(main_module.app)
         original_person_mask_service = main_module.person_mask_service

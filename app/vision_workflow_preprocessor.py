@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Sequence
@@ -132,6 +133,140 @@ def sample_video_workflow_frames(
         )
         for index, sample in enumerate(samples)
     ]
+
+
+@dataclass(frozen=True)
+class DynamicVideoSamplingConfig:
+    idle_interval_seconds: float = 10.0
+    occupied_interval_seconds: float = 5.0
+    transition_interval_seconds: float = 1.0
+    post_check_interval_seconds: float = 2.0
+    max_observations: int = 60
+    change_threshold: float = 0.12
+    stable_threshold: float = 0.04
+
+
+def sample_dynamic_video_workflow_frames(
+    *,
+    video_path: str | Path,
+    max_frames: int = 10,
+    interaction_roi: ROI | None = None,
+    person_mask_service: PersonMaskService | None = None,
+    sampling_config: DynamicVideoSamplingConfig | None = None,
+    frame_reader: Any | None = None,
+    duration_seconds: float | None = None,
+) -> list[dict[str, Any]]:
+    if max_frames <= 0:
+        return []
+
+    config = sampling_config or DynamicVideoSamplingConfig()
+    occupancy_service = person_mask_service or PersonMaskService()
+    capture = None
+    temp_copy: Path | None = None
+    resolved_duration_seconds = duration_seconds
+    reader = frame_reader
+    fps_value: float | None = None
+
+    if reader is None:
+        capture, temp_copy = open_video_capture(Path(video_path))
+        fps_candidate = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        fps_value = fps_candidate if fps_candidate > 0 else None
+        if resolved_duration_seconds is None and fps_value is not None:
+            frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+            if frame_count > 0:
+                resolved_duration_seconds = frame_count / fps_value
+
+        def reader(offset_seconds: float) -> dict[str, Any] | None:
+            assert capture is not None
+            capture.set(cv2.CAP_PROP_POS_MSEC, offset_seconds * 1000.0)
+            success, frame = capture.read()
+            if not success:
+                return None
+            frame_index = None
+            if fps_value is not None:
+                frame_index = int(round(offset_seconds * fps_value))
+            return {
+                "image": frame,
+                "frame_index": frame_index,
+                "fps": fps_value,
+                "offset_seconds": offset_seconds,
+            }
+
+    try:
+        offset_seconds = 0.0
+        observation_count = 0
+        previous_crop: np.ndarray | None = None
+        previous_person_present = False
+        previous_state = "idle"
+        samples: list[dict[str, Any]] = []
+
+        while len(samples) < max_frames and observation_count < config.max_observations:
+            if resolved_duration_seconds is not None and offset_seconds > resolved_duration_seconds + 1e-6:
+                break
+
+            sample = reader(offset_seconds) if reader is not None else None
+            if sample is None:
+                break
+            normalized_sample = normalize_video_frame_sample(
+                {
+                    **sample,
+                    "sample_index": observation_count,
+                },
+                interval_seconds=max(config.idle_interval_seconds, 0.1),
+            )
+            frame_image = normalized_sample["image"]
+            crop_image = crop_roi(frame_image, interaction_roi)
+            _, _, detections = occupancy_service.apply_black_mask(crop_image)
+            person_count = len(detections)
+            person_present = person_count > 0
+            change_score = compute_frame_change_score(previous_crop, crop_image)
+            frame_type, sampling_state, reason_codes = classify_dynamic_frame(
+                previous_state=previous_state,
+                previous_person_present=previous_person_present,
+                person_present=person_present,
+                change_score=change_score,
+                sampling_config=config,
+            )
+            normalized_change = max(0.0, min(change_score, 1.0))
+            priority = max(
+                0.0,
+                min(
+                    1.0,
+                    dynamic_frame_state_priority(frame_type)
+                    + normalized_change * 0.35
+                    + (0.15 if previous_person_present != person_present else 0.0),
+                ),
+            )
+            samples.append(
+                {
+                    **normalized_sample,
+                    "crop_image": crop_image,
+                    "frame_type": frame_type,
+                    "sampling_state": sampling_state,
+                    "reason_codes": reason_codes,
+                    "priority": round(priority, 3),
+                    "features": {
+                        "change_score": round(change_score, 4),
+                        "person_present": person_present,
+                        "person_count": person_count,
+                    },
+                }
+            )
+            previous_crop = crop_image
+            previous_person_present = person_present
+            previous_state = sampling_state
+            offset_seconds += interval_for_sampling_state(sampling_state, config)
+            observation_count += 1
+
+        if len(samples) == 1:
+            samples[0]["frame_type"] = "periodic_sample"
+            samples[0]["sampling_state"] = "idle"
+        return samples
+    finally:
+        if capture is not None:
+            capture.release()
+        if temp_copy and temp_copy.exists():
+            temp_copy.unlink(missing_ok=True)
 
 
 def build_workflow_frames_from_video(
@@ -356,6 +491,81 @@ def resolve_video_frame_offset_seconds(
     if frame_index is not None and fps is not None and float(fps) > 0:
         return float(frame_index) / float(fps)
     return float(sample_index * interval_seconds)
+
+
+def compute_frame_change_score(previous_crop: np.ndarray | None, current_crop: np.ndarray) -> float:
+    if previous_crop is None:
+        return 0.0
+
+    target_size = (96, 96)
+    previous_gray = cv2.cvtColor(previous_crop, cv2.COLOR_BGR2GRAY)
+    current_gray = cv2.cvtColor(current_crop, cv2.COLOR_BGR2GRAY)
+    previous_resized = cv2.resize(previous_gray, target_size, interpolation=cv2.INTER_AREA)
+    current_resized = cv2.resize(current_gray, target_size, interpolation=cv2.INTER_AREA)
+    previous_blurred = cv2.GaussianBlur(previous_resized, (5, 5), 0)
+    current_blurred = cv2.GaussianBlur(current_resized, (5, 5), 0)
+    diff = cv2.absdiff(previous_blurred, current_blurred)
+    baseline = max(1.0, float(previous_blurred.mean()), float(current_blurred.mean()))
+    return float((diff.mean() / baseline) / 2.0)
+
+
+def classify_dynamic_frame(
+    *,
+    previous_state: str,
+    previous_person_present: bool,
+    person_present: bool,
+    change_score: float,
+    sampling_config: DynamicVideoSamplingConfig,
+) -> tuple[str, str, list[str]]:
+    reason_codes: list[str] = []
+
+    if person_present:
+        if previous_person_present:
+            reason_codes.append("person_present")
+            return "occupied_representative", "occupied", reason_codes
+        if previous_state == "meal_end_candidate" and change_score >= sampling_config.change_threshold:
+            reason_codes.extend(["person_reentered", "high_table_change"])
+            return "cleaning_candidate", "cleaning_candidate", reason_codes
+        reason_codes.append("person_present")
+        return "occupied_representative", "occupied", reason_codes
+
+    if previous_state == "cleaning_candidate" and change_score <= sampling_config.stable_threshold:
+        reason_codes.append("post_check_stable")
+        return "post_check", "post_check", reason_codes
+
+    if previous_person_present:
+        reason_codes.append("person_left")
+        if change_score >= sampling_config.change_threshold:
+            reason_codes.append("high_table_change")
+        return "meal_end_candidate", "meal_end_candidate", reason_codes
+
+    if change_score >= sampling_config.change_threshold:
+        reason_codes.append("high_table_change")
+        return "cleaning_before_candidate", "meal_end_candidate", reason_codes
+
+    reason_codes.append("periodic_sample")
+    return "periodic_sample", "idle", reason_codes
+
+
+def interval_for_sampling_state(state: str, config: DynamicVideoSamplingConfig) -> float:
+    if state == "occupied":
+        return config.occupied_interval_seconds
+    if state in {"meal_end_candidate", "cleaning_candidate"}:
+        return config.transition_interval_seconds
+    if state == "post_check":
+        return config.post_check_interval_seconds
+    return config.idle_interval_seconds
+
+
+def dynamic_frame_state_priority(frame_type: str) -> float:
+    return {
+        "periodic_sample": 0.15,
+        "occupied_representative": 0.35,
+        "meal_end_candidate": 0.7,
+        "cleaning_before_candidate": 0.78,
+        "cleaning_candidate": 0.92,
+        "post_check": 0.82,
+    }.get(frame_type, 0.15)
 
 
 def first_occupancy_candidate_started_at(

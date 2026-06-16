@@ -9,11 +9,14 @@ from app.action_cleanliness import ActionCleanlinessService, TableOccupancySampl
 from app.person_masking import PersonDetection
 from app.schemas import ActionWorkflowRequest, ROI
 from app.vision_workflow_preprocessor import (
+    DynamicVideoSamplingConfig,
     build_meal_occupancy_sequence,
+    compute_frame_change_score,
     build_workflow_frame_from_image,
     build_workflow_frames_from_images,
     build_workflow_frames_from_video,
     captured_at_for_video_frame,
+    sample_dynamic_video_workflow_frames,
     sample_video_workflow_frames,
 )
 
@@ -36,6 +39,22 @@ class FakePersonMaskService:
 
 
 class VisionWorkflowPreprocessorTest(unittest.TestCase):
+    def test_compute_frame_change_score_stays_low_for_identical_images(self) -> None:
+        image = np.zeros((32, 32, 3), dtype=np.uint8)
+
+        change_score = compute_frame_change_score(image, image.copy())
+
+        self.assertLess(change_score, 0.01)
+
+    def test_compute_frame_change_score_increases_when_roi_changes(self) -> None:
+        previous = np.zeros((32, 32, 3), dtype=np.uint8)
+        current = previous.copy()
+        current[8:24, 8:24] = 255
+
+        change_score = compute_frame_change_score(previous, current)
+
+        self.assertGreater(change_score, 0.2)
+
     def test_sample_video_workflow_frames_uses_fake_extractor_output(self) -> None:
         def fake_extractor(video_path, *, interval_seconds, max_frames):
             self.assertEqual(str(video_path), "demo.avi")
@@ -270,6 +289,69 @@ class VisionWorkflowPreprocessorTest(unittest.TestCase):
         self.assertEqual(len(request.frames), 2)
         self.assertEqual(request.frames[0].captured_at.isoformat(timespec="seconds"), "2026-06-03T14:00:00")
         self.assertEqual(request.frames[1].captured_at.isoformat(timespec="seconds"), "2026-06-03T14:01:00")
+
+    def test_dynamic_video_sampler_detects_meal_end_cleaning_and_post_check(self) -> None:
+        baseline = np.zeros((32, 32, 3), dtype=np.uint8)
+        changed = baseline.copy()
+        changed[8:24, 8:24] = 255
+        frames_by_offset = {
+            0.0: baseline,
+            5.0: baseline,
+            10.0: baseline,
+            11.0: changed,
+            12.0: changed,
+        }
+
+        def fake_reader(offset_seconds: float) -> dict[str, object] | None:
+            image = frames_by_offset.get(round(offset_seconds, 1))
+            if image is None:
+                return None
+            return {
+                "image": image.copy(),
+                "offset_seconds": float(round(offset_seconds, 1)),
+                "fps": 1.0,
+                "frame_index": int(round(offset_seconds)),
+            }
+
+        samples = sample_dynamic_video_workflow_frames(
+            video_path="demo.avi",
+            max_frames=5,
+            person_mask_service=FakePersonMaskService(
+                [
+                    [PersonDetection(x=0, y=0, width=4, height=4, score=0.9, source="fake")],
+                    [PersonDetection(x=0, y=0, width=4, height=4, score=0.9, source="fake")],
+                    [],
+                    [PersonDetection(x=0, y=0, width=4, height=4, score=0.9, source="fake")],
+                    [],
+                ]
+            ),
+            sampling_config=DynamicVideoSamplingConfig(
+                idle_interval_seconds=10.0,
+                occupied_interval_seconds=5.0,
+                transition_interval_seconds=1.0,
+                post_check_interval_seconds=2.0,
+                max_observations=8,
+                change_threshold=0.12,
+                stable_threshold=0.04,
+            ),
+            frame_reader=fake_reader,
+            duration_seconds=15.0,
+        )
+
+        self.assertEqual([sample["offset_seconds"] for sample in samples], [0.0, 5.0, 10.0, 11.0, 12.0])
+        self.assertEqual(
+            [sample["frame_type"] for sample in samples],
+            [
+                "occupied_representative",
+                "occupied_representative",
+                "meal_end_candidate",
+                "cleaning_candidate",
+                "post_check",
+            ],
+        )
+        self.assertIn("person_left", samples[2]["reason_codes"])
+        self.assertIn("person_reentered", samples[3]["reason_codes"])
+        self.assertIn("post_check_stable", samples[4]["reason_codes"])
 
     def test_video_generated_frames_can_form_long_dwell_sequence(self) -> None:
         def fake_extractor(video_path, *, interval_seconds, max_frames):

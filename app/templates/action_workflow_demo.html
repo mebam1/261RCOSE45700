@@ -103,6 +103,10 @@
         <span>Max Frames</span>
         <input type="number" name="max_frames" value="{{ max_frames }}" min="2" step="1" required>
       </label>
+      <label class="checkbox-row no-top-pad">
+        <input type="checkbox" name="dynamic_sampling" value="true" {% if dynamic_sampling %}checked{% endif %}>
+        <span>Use dynamic candidate sampling</span>
+      </label>
       <label>
         <span>Interaction ROI JSON</span>
         <textarea name="interaction_roi_json" rows="6" placeholder='{"name":"TABLE","points":[{"x":0,"y":0},{"x":100,"y":0},{"x":100,"y":100},{"x":0,"y":100}]}'>{{ interaction_roi_json }}</textarea>
@@ -140,9 +144,21 @@
         <input type="checkbox" name="save_result" value="true" {% if save_result %}checked{% endif %}>
         <span>Save result to reports</span>
       </label>
-      <button type="submit" class="primary-button">Run Video Workflow</button>
+      <div class="button-row">
+        <button type="button" id="preview-video-candidates" class="secondary-button">Preview Candidate Frames</button>
+        <button type="submit" class="primary-button">Run Video Workflow</button>
+      </div>
     </form>
   </section>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>Dynamic Candidate Preview</h2>
+  </div>
+  <p class="helper" id="candidate-preview-status">Preview candidate frames from the video form to inspect the sampler output.</p>
+  <div id="candidate-preview-grid" class="candidate-grid"></div>
+  <pre id="candidate-preview-json" class="helper"></pre>
 </section>
 
 <section class="panel">
@@ -157,6 +173,38 @@
 </section>
 
 <script>
+  function renderCandidatePreview(candidates) {
+    const grid = document.getElementById("candidate-preview-grid");
+    grid.innerHTML = "";
+    candidates.forEach((candidate) => {
+      const card = document.createElement("article");
+      card.className = "candidate-card";
+
+      if (candidate.preview_url) {
+        const image = document.createElement("img");
+        image.src = candidate.preview_url;
+        image.alt = `${candidate.frame_type} preview`;
+        card.appendChild(image);
+      }
+
+      const title = document.createElement("strong");
+      title.textContent = `${candidate.frame_type} @ ${candidate.timestamp_sec}s`;
+      card.appendChild(title);
+
+      const meta = document.createElement("p");
+      meta.className = "candidate-meta";
+      meta.textContent = `state=${candidate.sampling_state} priority=${candidate.priority}`;
+      card.appendChild(meta);
+
+      const reasons = document.createElement("p");
+      reasons.className = "candidate-meta";
+      reasons.textContent = `reasons: ${(candidate.reason_codes || []).join(", ")}`;
+      card.appendChild(reasons);
+
+      grid.appendChild(card);
+    });
+  }
+
   async function submitWorkflowForm(formId, endpoint) {
     const form = document.getElementById(formId);
     form.addEventListener("submit", async (event) => {
@@ -182,6 +230,28 @@
       }
     });
   }
+
+  document.getElementById("preview-video-candidates").addEventListener("click", async () => {
+    const form = document.getElementById("workflow-video-form");
+    const status = document.getElementById("candidate-preview-status");
+    const result = document.getElementById("candidate-preview-json");
+    status.textContent = "Sampling video candidates...";
+    result.textContent = "";
+
+    const response = await fetch("/api/action-cleanliness/workflow-video-candidates", {
+      method: "POST",
+      body: new FormData(form),
+    });
+    const payload = await response.json();
+    result.textContent = JSON.stringify(payload, null, 2);
+    if (response.ok) {
+      status.textContent = `Sampler returned ${payload.candidate_count} candidate frames.`;
+      renderCandidatePreview(payload.candidates || []);
+    } else {
+      status.textContent = `Preview failed (${response.status}).`;
+      renderCandidatePreview([]);
+    }
+  });
 
   submitWorkflowForm("workflow-images-form", "/api/action-cleanliness/workflow-from-images");
   submitWorkflowForm("workflow-video-form", "/api/action-cleanliness/workflow-from-video");

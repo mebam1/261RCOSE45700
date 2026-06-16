@@ -79,6 +79,21 @@ def file_data_url(path: Path) -> str:
     return f"data:{guess_mime_type(path)};base64,{encoded}"
 
 
+def image_data_url(image: np.ndarray, extension: str = ".jpg") -> str:
+    normalized_extension = extension.lower() or ".jpg"
+    if normalized_extension == ".jpeg":
+        normalized_extension = ".jpg"
+    success, encoded = cv2.imencode(normalized_extension, image)
+    if not success:
+        raise ValueError("cannot encode image data url")
+    if normalized_extension == ".png":
+        mime_type = "image/png"
+    else:
+        mime_type = "image/jpeg"
+    payload = base64.b64encode(encoded.tobytes()).decode("ascii")
+    return f"data:{mime_type};base64,{payload}"
+
+
 def open_video_capture(video_path: Path) -> tuple[cv2.VideoCapture, Path | None]:
     temp_copy: Path | None = None
     capture = cv2.VideoCapture(str(video_path))
