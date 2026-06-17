@@ -103,10 +103,8 @@
         <span>Max Frames</span>
         <input type="number" name="max_frames" value="{{ max_frames }}" min="2" step="1" required>
       </label>
-      <label class="checkbox-row no-top-pad">
-        <input type="checkbox" name="dynamic_sampling" value="true" {% if dynamic_sampling %}checked{% endif %}>
-        <span>Use dynamic candidate sampling</span>
-      </label>
+      <input type="hidden" name="dynamic_sampling" value="true">
+      <p class="helper">Video workflow runs through the dynamic frame sampler by default and returns sampler metadata alongside the workflow result.</p>
       <label>
         <span>Interaction ROI JSON</span>
         <textarea name="interaction_roi_json" rows="6" placeholder='{"name":"TABLE","points":[{"x":0,"y":0},{"x":100,"y":0},{"x":100,"y":100},{"x":0,"y":100}]}'>{{ interaction_roi_json }}</textarea>

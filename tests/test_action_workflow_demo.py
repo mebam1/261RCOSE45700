@@ -336,15 +336,42 @@ class ActionWorkflowDemoTest(unittest.TestCase):
         self.assertEqual(payload["frames"][2]["payload"]["yolo_mess_score"], 0.8)
         self.assertIn("HIGH_YOLO_MESS_CAP_35", payload["applied_caps"])
 
-    def test_workflow_from_video_returns_result(self) -> None:
+    def test_workflow_from_video_uses_dynamic_sampler_by_default(self) -> None:
         client = TestClient(main_module.app)
         original_person_mask_service = main_module.person_mask_service
-        original_sampler = main_module.sample_video_workflow_frames
+        original_sampler = main_module.sample_dynamic_video_workflow_frames
         main_module.person_mask_service = FakePersonMaskService([2, 0, 0])
-        main_module.sample_video_workflow_frames = lambda *args, **kwargs: [
-            {"image": np.zeros((24, 24, 3), dtype=np.uint8), "offset_seconds": 0.0},
-            {"image": np.zeros((24, 24, 3), dtype=np.uint8), "offset_seconds": 120.0},
-            {"image": np.zeros((24, 24, 3), dtype=np.uint8), "offset_seconds": 240.0},
+        main_module.sample_dynamic_video_workflow_frames = lambda *args, **kwargs: [
+            {
+                "image": np.zeros((24, 24, 3), dtype=np.uint8),
+                "crop_image": np.zeros((16, 16, 3), dtype=np.uint8),
+                "offset_seconds": 0.0,
+                "frame_type": "occupied_representative",
+                "sampling_state": "occupied",
+                "priority": 0.42,
+                "reason_codes": ["person_present"],
+                "features": {"change_score": 0.0, "person_present": True, "person_count": 1},
+            },
+            {
+                "image": np.zeros((24, 24, 3), dtype=np.uint8),
+                "crop_image": np.zeros((16, 16, 3), dtype=np.uint8),
+                "offset_seconds": 120.0,
+                "frame_type": "meal_end_candidate",
+                "sampling_state": "meal_end_candidate",
+                "priority": 0.81,
+                "reason_codes": ["person_left"],
+                "features": {"change_score": 0.12, "person_present": False, "person_count": 0},
+            },
+            {
+                "image": np.zeros((24, 24, 3), dtype=np.uint8),
+                "crop_image": np.zeros((16, 16, 3), dtype=np.uint8),
+                "offset_seconds": 240.0,
+                "frame_type": "post_check",
+                "sampling_state": "post_check",
+                "priority": 0.76,
+                "reason_codes": ["post_check_stable"],
+                "features": {"change_score": 0.02, "person_present": False, "person_count": 0},
+            },
         ]
 
         try:
@@ -364,11 +391,12 @@ class ActionWorkflowDemoTest(unittest.TestCase):
             )
         finally:
             main_module.person_mask_service = original_person_mask_service
-            main_module.sample_video_workflow_frames = original_sampler
+            main_module.sample_dynamic_video_workflow_frames = original_sampler
 
         payload = response.json()
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(payload["frames"]), 3)
+        self.assertTrue(payload["dynamic_sampling"])
         self.assertEqual(payload["cleaning_status"], "CLEANED_LIKELY")
 
     def test_workflow_video_candidates_returns_preview_metadata(self) -> None:
@@ -500,7 +528,7 @@ class ActionWorkflowDemoTest(unittest.TestCase):
     def test_workflow_from_video_builds_visual_payloads_from_yolo(self) -> None:
         client = TestClient(main_module.app)
         original_person_mask_service = main_module.person_mask_service
-        original_sampler = main_module.sample_video_workflow_frames
+        original_sampler = main_module.sample_dynamic_video_workflow_frames
         original_yolo_helper = main_module.workflow_yolo_helper
         fake_yolo_helper = FakeYoloHelper(
             [
@@ -510,10 +538,37 @@ class ActionWorkflowDemoTest(unittest.TestCase):
             ]
         )
         main_module.person_mask_service = FakePersonMaskService([2, 0, 0])
-        main_module.sample_video_workflow_frames = lambda *args, **kwargs: [
-            {"image": np.zeros((24, 24, 3), dtype=np.uint8), "offset_seconds": 0.0},
-            {"image": np.zeros((24, 24, 3), dtype=np.uint8), "offset_seconds": 120.0},
-            {"image": np.zeros((24, 24, 3), dtype=np.uint8), "offset_seconds": 240.0},
+        main_module.sample_dynamic_video_workflow_frames = lambda *args, **kwargs: [
+            {
+                "image": np.zeros((24, 24, 3), dtype=np.uint8),
+                "crop_image": np.zeros((16, 16, 3), dtype=np.uint8),
+                "offset_seconds": 0.0,
+                "frame_type": "occupied_representative",
+                "sampling_state": "occupied",
+                "priority": 0.42,
+                "reason_codes": ["person_present"],
+                "features": {"change_score": 0.0, "person_present": True, "person_count": 1},
+            },
+            {
+                "image": np.zeros((24, 24, 3), dtype=np.uint8),
+                "crop_image": np.zeros((16, 16, 3), dtype=np.uint8),
+                "offset_seconds": 120.0,
+                "frame_type": "meal_end_candidate",
+                "sampling_state": "meal_end_candidate",
+                "priority": 0.81,
+                "reason_codes": ["person_left"],
+                "features": {"change_score": 0.12, "person_present": False, "person_count": 0},
+            },
+            {
+                "image": np.zeros((24, 24, 3), dtype=np.uint8),
+                "crop_image": np.zeros((16, 16, 3), dtype=np.uint8),
+                "offset_seconds": 240.0,
+                "frame_type": "post_check",
+                "sampling_state": "post_check",
+                "priority": 0.76,
+                "reason_codes": ["post_check_stable"],
+                "features": {"change_score": 0.02, "person_present": False, "person_count": 0},
+            },
         ]
         main_module.workflow_yolo_helper = fake_yolo_helper
 
@@ -534,7 +589,7 @@ class ActionWorkflowDemoTest(unittest.TestCase):
             )
         finally:
             main_module.person_mask_service = original_person_mask_service
-            main_module.sample_video_workflow_frames = original_sampler
+            main_module.sample_dynamic_video_workflow_frames = original_sampler
             main_module.workflow_yolo_helper = original_yolo_helper
 
         payload = response.json()

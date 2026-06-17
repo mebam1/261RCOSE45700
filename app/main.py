@@ -1672,7 +1672,7 @@ async def action_cleanliness_workflow_from_video(
     captured_at_start: str = Form(...),
     interval_seconds: float = Form(default=30.0),
     max_frames: int = Form(default=10),
-    dynamic_sampling: bool = Form(default=False),
+    dynamic_sampling: bool = Form(default=True),
     save_result: bool = Form(default=False),
     interaction_roi_json: str = Form(default=""),
     staff_zone_visits_json: str = Form(default=""),
