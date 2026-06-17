@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.mp4
 
 data/uploads/
 data/mobile_videos/
@@ -11,6 +12,8 @@ data/analysis_crops/
 data/person_masks/
 data/mvp1.sqlite3
 data/poster_templates/*_poster_*
+
+simulator/output/
 
 frontend/node_modules/
 frontend/dist/
