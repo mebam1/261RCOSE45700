@@ -413,9 +413,11 @@ class ActionWorkflowDemoTest(unittest.TestCase):
 
         payload = response.json()
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(payload["candidate_count"], 2)
-        self.assertEqual(payload["candidates"][1]["frame_type"], "meal_end_candidate")
-        self.assertTrue(payload["candidates"][1]["preview_url"].startswith("data:image/"))
+        self.assertEqual(payload["candidate_count"], 1)
+        self.assertEqual(payload["debug_trace_count"], 2)
+        self.assertEqual(payload["selected_candidates"][0]["frame_type"], "meal_end_candidate")
+        self.assertTrue(payload["selected_candidates"][0]["preview_url"].startswith("data:image/"))
+        self.assertEqual(payload["debug_trace"][0]["frame_type"], "periodic_sample")
 
     def test_workflow_from_video_dynamic_sampling_includes_candidate_summary(self) -> None:
         client = TestClient(main_module.app)
@@ -480,6 +482,8 @@ class ActionWorkflowDemoTest(unittest.TestCase):
         self.assertTrue(payload["dynamic_sampling"])
         self.assertEqual(payload["candidate_count"], 3)
         self.assertEqual(payload["candidate_summary"][1]["frame_type"], "meal_end_candidate")
+        self.assertEqual(payload["debug_trace_count"], 3)
+        self.assertEqual(payload["episodes"][0]["post_check_at"], 240.0)
         self.assertEqual(payload["frames"][1]["payload"]["sampler_frame_type"], "meal_end_candidate")
         self.assertEqual(payload["frames"][2]["payload"]["sampler_reason_codes"], ["post_check_stable"])
 

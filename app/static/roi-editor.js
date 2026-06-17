@@ -6,6 +6,7 @@
   const deleteButton = document.getElementById("delete-roi");
   const clearButton = document.getElementById("clear-rois");
   const roisJsonInput = document.getElementById("rois-json");
+  const previewStatus = document.getElementById("reference-preview-status");
   const form = document.getElementById("setup-form");
 
   if (!canvas || !form) {
@@ -22,6 +23,13 @@
     draftRect: null,
     draggingHandle: null,
   };
+
+  function setPreviewStatus(message) {
+    if (previewStatus) {
+      previewStatus.textContent = message;
+    }
+    console.log(`[ROI Setup] ${message}`);
+  }
 
   function clampPoint(point) {
     return {
@@ -172,6 +180,7 @@
 
   function setImageSource(source) {
     if (!source) {
+      setPreviewStatus("Reference source was empty, so nothing was rendered.");
       return;
     }
     const image = new Image();
@@ -180,8 +189,80 @@
       canvas.width = image.width;
       canvas.height = image.height;
       draw();
+      setPreviewStatus(`Reference canvas ready: ${image.width}x${image.height}.`);
+    };
+    image.onerror = () => {
+      setPreviewStatus("Reference image failed to load in the browser.");
     };
     image.src = source;
+  }
+
+  function isVideoFile(file) {
+    if (file.type && file.type.startsWith("video/")) {
+      return true;
+    }
+    return /\.(mp4|mov|m4v|avi|webm|mkv)$/i.test(file.name || "");
+  }
+
+  function loadVideoFirstFrame(file) {
+    setPreviewStatus(`Video selected: ${file.name}. Waiting for metadata...`);
+    const objectUrl = URL.createObjectURL(file);
+    const video = document.createElement("video");
+    video.preload = "auto";
+    video.muted = true;
+    video.playsInline = true;
+    video.crossOrigin = "anonymous";
+
+    const cleanup = () => {
+      URL.revokeObjectURL(objectUrl);
+    };
+
+    let rendered = false;
+    const renderFrame = () => {
+      if (rendered) {
+        return;
+      }
+      if (!video.videoWidth || !video.videoHeight) {
+        setPreviewStatus("Video metadata loaded, but frame dimensions are not available yet.");
+        return;
+      }
+      const frameCanvas = document.createElement("canvas");
+      frameCanvas.width = video.videoWidth || 960;
+      frameCanvas.height = video.videoHeight || 540;
+      const frameContext = frameCanvas.getContext("2d");
+      frameContext.drawImage(video, 0, 0, frameCanvas.width, frameCanvas.height);
+      setImageSource(frameCanvas.toDataURL("image/png"));
+      rendered = true;
+      setPreviewStatus(`First video frame extracted: ${frameCanvas.width}x${frameCanvas.height}.`);
+      cleanup();
+    };
+
+    video.addEventListener("loadeddata", renderFrame, { once: true });
+    video.addEventListener("seeked", renderFrame, { once: true });
+    video.addEventListener("loadedmetadata", () => {
+      setPreviewStatus(
+        `Video metadata loaded: ${video.videoWidth || "?"}x${video.videoHeight || "?"}, duration=${Number.isFinite(video.duration) ? video.duration.toFixed(2) : "unknown"}s.`
+      );
+      if (video.readyState >= 2) {
+        renderFrame();
+        return;
+      }
+      try {
+        setPreviewStatus("Video metadata loaded. Requesting the first decodable frame...");
+        video.currentTime = Math.min(0.001, Number.isFinite(video.duration) ? video.duration : 0.001);
+      } catch (error) {
+        setPreviewStatus("Video seek for first-frame preview was blocked before buffering completed.");
+      }
+    }, { once: true });
+
+    video.addEventListener("error", () => {
+      cleanup();
+      setPreviewStatus("Browser could not decode the selected video for preview.");
+      window.alert("Could not load the first frame from the selected video.");
+    }, { once: true });
+
+    video.src = objectUrl;
+    video.load();
   }
 
   function canvasPoint(event) {
@@ -322,10 +403,18 @@
   imageInput.addEventListener("change", (event) => {
     const file = event.target.files && event.target.files[0];
     if (!file) {
+      setPreviewStatus("No file is currently selected.");
       return;
     }
+    setPreviewStatus(`Selected file: ${file.name} (${file.type || "unknown MIME type"}).`);
+    if (isVideoFile(file)) {
+      loadVideoFirstFrame(file);
+      return;
+    }
+    setPreviewStatus(`Image selected: ${file.name}. Loading preview...`);
     const reader = new FileReader();
     reader.onload = (loadEvent) => setImageSource(loadEvent.target.result);
+    reader.onerror = () => setPreviewStatus("Image file could not be read in the browser.");
     reader.readAsDataURL(file);
   });
 
@@ -348,6 +437,7 @@
 
   form.addEventListener("submit", (event) => {
     if (!state.rois.length) {
+      setPreviewStatus("Submit blocked because no ROI has been added yet.");
       event.preventDefault();
       window.alert("Add at least one ROI before saving the CCTV setup.");
       return;
@@ -365,6 +455,7 @@
     renderRoiList();
     draw();
     roisJsonInput.value = JSON.stringify(state.rois);
+    setPreviewStatus(`Submitting CCTV setup with ${state.rois.length} ROI(s). The selected media file will be uploaded now.`);
   });
 
   const initial = window.initialConfig;
@@ -378,11 +469,13 @@
     }
     renderRoiList();
     if (canvas.dataset.referenceUrl) {
+      setPreviewStatus("Loading the saved reference image for this CCTV setup...");
       setImageSource(canvas.dataset.referenceUrl);
     }
   } else {
     canvas.width = 960;
     canvas.height = 540;
     draw();
+    setPreviewStatus("No saved reference image yet. Select an image or video to begin.");
   }
 })();

@@ -27,7 +27,7 @@ from app.action_cleanliness import (
     parse_action_time_value,
     parse_trajectory_json,
 )
-from app.analysis import AnalysisService, image_data_url, read_image, save_analysis_crop, write_image
+from app.analysis import AnalysisService, extract_first_video_frame, image_data_url, read_image, save_analysis_crop, write_image
 from app.auth import create_access_token, hash_password, normalize_user_id, parse_access_token, validate_password, verify_password
 from app.cleanliness import (
     CLEANLINESS_IMAGE_EXTENSIONS,
@@ -81,6 +81,7 @@ from app.vision_workflow_preprocessor import (
     captured_at_for_video_frame,
     sample_dynamic_video_workflow_frames,
     sample_video_workflow_frames,
+    summarize_dynamic_video_samples,
 )
 from app.yolo_module import yolo_module
 
@@ -296,11 +297,19 @@ async def save_setup(
         raise HTTPException(status_code=400, detail=f"invalid roi payload: {exc}") from exc
 
     temp_path: Path | None = None
+    uploaded_temp_path: Path | None = None
     if reference_image and reference_image.filename:
         suffix = Path(reference_image.filename).suffix.lower() or ".png"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
             shutil.copyfileobj(reference_image.file, temp_file)
-            temp_path = Path(temp_file.name)
+            uploaded_temp_path = Path(temp_file.name)
+        if suffix in VIDEO_CLEANLINESS_EXTENSIONS:
+            extracted_frame = extract_first_video_frame(uploaded_temp_path)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as temp_frame_file:
+                temp_path = Path(temp_frame_file.name)
+            write_image(temp_path, extracted_frame)
+        else:
+            temp_path = uploaded_temp_path
 
     try:
         config = config_store.save_config(
@@ -315,6 +324,8 @@ async def save_setup(
     finally:
         if temp_path and temp_path.exists():
             temp_path.unlink(missing_ok=True)
+        if uploaded_temp_path and uploaded_temp_path != temp_path and uploaded_temp_path.exists():
+            uploaded_temp_path.unlink(missing_ok=True)
 
     return RedirectResponse(
         url=f"/setup?store_name={quote_plus(config.store_name)}&config_id={config.config_id}",
@@ -456,6 +467,8 @@ def serialize_dynamic_video_candidate(
         "priority": sample.get("priority"),
         "reason_codes": list(sample.get("reason_codes", [])),
         "features": dict(sample.get("features", {})),
+        "episode_id": sample.get("episode_id"),
+        "selected_for_review": bool(sample.get("selected_for_review", False)),
     }
     crop_image = sample.get("crop_image")
     if crop_image is not None:
@@ -471,6 +484,37 @@ def sampler_metadata_payload(sample: dict[str, Any]) -> dict[str, Any]:
         "sampler_state": sample.get("sampling_state"),
         "sampler_features": dict(sample.get("features", {})),
         "sampler_timestamp_sec": round(float(sample.get("offset_seconds", 0.0)), 2),
+        "sampler_episode_id": sample.get("episode_id"),
+        "sampler_selected_for_review": bool(sample.get("selected_for_review", False)),
+    }
+
+
+def serialize_dynamic_video_sampling_payload(
+    samples: list[dict[str, Any]],
+    *,
+    table_id: str,
+    captured_at_start: str,
+) -> dict[str, Any]:
+    sampling_summary = summarize_dynamic_video_samples(samples)
+    debug_trace = [
+        serialize_dynamic_video_candidate(sample, captured_at_start=captured_at_start)
+        for sample in sampling_summary["debug_trace"]
+    ]
+    selected_candidates = [
+        serialize_dynamic_video_candidate(sample, captured_at_start=captured_at_start)
+        for sample in sampling_summary["selected_samples"]
+    ]
+    return {
+        "table_id": table_id,
+        "dynamic_sampling": True,
+        "candidate_count": len(selected_candidates),
+        "debug_trace_count": len(debug_trace),
+        "selected_candidates": selected_candidates,
+        "candidates": selected_candidates,
+        "candidate_summary": selected_candidates,
+        "debug_trace": debug_trace,
+        "events": sampling_summary["events"],
+        "episodes": sampling_summary["episodes"],
     }
 
 
@@ -1385,6 +1429,25 @@ def action_workflow_demo_page(request: Request) -> Any:
     )
 
 
+@app.get("/frame-sampler-demo")
+def frame_sampler_demo_page(request: Request) -> Any:
+    configs = config_store.list_configs()
+    return templates.TemplateResponse(
+        request,
+        "frame_sampler_demo.html",
+        {
+            "request": request,
+            "title": "Frame Sampler Demo",
+            "captured_at_start": "2026-06-03T14:10:20",
+            "interval_seconds": 10,
+            "max_frames": 12,
+            "interaction_roi_json": "",
+            "configs": configs,
+            "configs_payload": [config.to_dict() for config in configs],
+        },
+    )
+
+
 @app.post("/action-cleanliness")
 async def action_cleanliness_submit(
     request: Request,
@@ -1498,15 +1561,11 @@ async def action_cleanliness_workflow_video_candidates(
         )
 
     return JSONResponse(
-        {
-            "table_id": table_id,
-            "candidate_count": len(samples),
-            "dynamic_sampling": True,
-            "candidates": [
-                serialize_dynamic_video_candidate(sample, captured_at_start=captured_at_start)
-                for sample in samples
-            ],
-        }
+        serialize_dynamic_video_sampling_payload(
+            samples,
+            table_id=table_id,
+            captured_at_start=captured_at_start,
+        )
     )
 
 
@@ -1673,12 +1732,13 @@ async def action_cleanliness_workflow_from_video(
     )
     response_payload = build_action_workflow_response(payload)
     if dynamic_sampling:
-        response_payload["dynamic_sampling"] = True
-        response_payload["candidate_count"] = len(samples)
-        response_payload["candidate_summary"] = [
-            serialize_dynamic_video_candidate(sample, captured_at_start=captured_at_start)
-            for sample in samples
-        ]
+        response_payload.update(
+            serialize_dynamic_video_sampling_payload(
+                samples,
+                table_id=table_id,
+                captured_at_start=captured_at_start,
+            )
+        )
     return JSONResponse(response_payload)
 
 

@@ -56,9 +56,11 @@
       </label>
 
       <label>
-        <span>Reference image</span>
-        <input type="file" id="reference-image" name="reference_image" accept="image/*" {% if not selected_config %}required{% endif %}>
+        <span>Reference image or video</span>
+        <input type="file" id="reference-image" name="reference_image" accept="image/*,video/*" {% if not selected_config %}required{% endif %}>
       </label>
+      <p class="helper">If you upload a video, the first frame is extracted immediately for ROI drawing and saved as the reference image.</p>
+      <p class="helper" id="reference-preview-status">Select an image or video to load the ROI reference canvas.</p>
 
       <input type="hidden" name="rois_json" id="rois-json">
       <input type="hidden" name="existing_reference_path" value="{{ selected_config.reference_image_path if selected_config else '' }}">

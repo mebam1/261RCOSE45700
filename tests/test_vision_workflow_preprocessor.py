@@ -18,6 +18,7 @@ from app.vision_workflow_preprocessor import (
     captured_at_for_video_frame,
     sample_dynamic_video_workflow_frames,
     sample_video_workflow_frames,
+    summarize_dynamic_video_samples,
 )
 
 
@@ -352,6 +353,76 @@ class VisionWorkflowPreprocessorTest(unittest.TestCase):
         self.assertIn("person_left", samples[2]["reason_codes"])
         self.assertIn("person_reentered", samples[3]["reason_codes"])
         self.assertIn("post_check_stable", samples[4]["reason_codes"])
+
+    def test_dynamic_video_sampler_summary_keeps_event_frames_and_drops_redundant_occupied_frames(self) -> None:
+        samples = [
+            {
+                "image": np.zeros((24, 24, 3), dtype=np.uint8),
+                "crop_image": np.zeros((16, 16, 3), dtype=np.uint8),
+                "offset_seconds": 0.0,
+                "frame_type": "occupied_representative",
+                "sampling_state": "occupied",
+                "priority": 0.35,
+                "reason_codes": ["person_present"],
+                "features": {"change_score": 0.01, "person_present": True, "person_count": 1},
+            },
+            {
+                "image": np.zeros((24, 24, 3), dtype=np.uint8),
+                "crop_image": np.zeros((16, 16, 3), dtype=np.uint8),
+                "offset_seconds": 5.0,
+                "frame_type": "occupied_representative",
+                "sampling_state": "occupied",
+                "priority": 0.36,
+                "reason_codes": ["person_present"],
+                "features": {"change_score": 0.02, "person_present": True, "person_count": 2},
+            },
+            {
+                "image": np.zeros((24, 24, 3), dtype=np.uint8),
+                "crop_image": np.zeros((16, 16, 3), dtype=np.uint8),
+                "offset_seconds": 10.0,
+                "frame_type": "meal_end_candidate",
+                "sampling_state": "meal_end_candidate",
+                "priority": 0.82,
+                "reason_codes": ["person_left"],
+                "features": {"change_score": 0.2, "person_present": False, "person_count": 0},
+            },
+            {
+                "image": np.zeros((24, 24, 3), dtype=np.uint8),
+                "crop_image": np.zeros((16, 16, 3), dtype=np.uint8),
+                "offset_seconds": 11.0,
+                "frame_type": "cleaning_candidate",
+                "sampling_state": "cleaning_candidate",
+                "priority": 0.93,
+                "reason_codes": ["person_reentered", "high_table_change"],
+                "features": {"change_score": 0.22, "person_present": True, "person_count": 1},
+            },
+            {
+                "image": np.zeros((24, 24, 3), dtype=np.uint8),
+                "crop_image": np.zeros((16, 16, 3), dtype=np.uint8),
+                "offset_seconds": 12.0,
+                "frame_type": "post_check",
+                "sampling_state": "post_check",
+                "priority": 0.8,
+                "reason_codes": ["post_check_stable"],
+                "features": {"change_score": 0.02, "person_present": False, "person_count": 0},
+            },
+        ]
+
+        summary = summarize_dynamic_video_samples(samples)
+
+        self.assertEqual(len(summary["debug_trace"]), 5)
+        self.assertEqual(
+            [sample["frame_type"] for sample in summary["selected_samples"]],
+            [
+                "occupied_representative",
+                "meal_end_candidate",
+                "cleaning_candidate",
+                "post_check",
+            ],
+        )
+        self.assertFalse(summary["debug_trace"][1]["selected_for_review"])
+        self.assertEqual(len(summary["episodes"]), 1)
+        self.assertEqual(summary["episodes"][0]["meal_end_at"], 10.0)
 
     def test_video_generated_frames_can_form_long_dwell_sequence(self) -> None:
         def fake_extractor(video_path, *, interval_seconds, max_frames):
