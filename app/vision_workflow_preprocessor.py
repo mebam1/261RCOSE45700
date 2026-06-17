@@ -16,7 +16,7 @@ from app.action_cleanliness import (
     parse_datetime_value,
 )
 from app.analysis import crop_roi as crop_image_to_roi, open_video_capture, read_image
-from app.person_masking import PersonMaskService
+from app.person_masking import PersonDetection, PersonMaskService
 from app.schemas import ROI
 
 
@@ -24,6 +24,187 @@ def crop_roi(image: np.ndarray, roi: ROI | None) -> np.ndarray:
     if roi is None:
         return image
     return crop_image_to_roi(image, roi)
+
+
+def roi_to_rect(roi: ROI) -> ImageRect:
+    bounds = roi.bounds
+    return ImageRect(
+        x=int(bounds["x"]),
+        y=int(bounds["y"]),
+        width=int(bounds["width"]),
+        height=int(bounds["height"]),
+    )
+
+
+def expanded_interaction_rect(
+    table_rect: ImageRect,
+    image_shape: tuple[int, ...],
+    *,
+    expand_x: float,
+    expand_y: float,
+) -> ImageRect:
+    image_height, image_width = image_shape[:2]
+    pad_x = int(round(table_rect.width * expand_x))
+    pad_y = int(round(table_rect.height * expand_y))
+    left = max(0, table_rect.x - pad_x)
+    top = max(0, table_rect.y - pad_y)
+    right = min(image_width, table_rect.right + pad_x)
+    bottom = min(image_height, table_rect.bottom + pad_y)
+    return ImageRect(x=left, y=top, width=max(1, right - left), height=max(1, bottom - top))
+
+
+def crop_rect(image: np.ndarray, rect: ImageRect) -> np.ndarray:
+    return image[rect.y : rect.bottom, rect.x : rect.right]
+
+
+def detection_to_frame_rect(detection: PersonDetection, origin: ImageRect) -> ImageRect:
+    return ImageRect(
+        x=origin.x + detection.x,
+        y=origin.y + detection.y,
+        width=detection.width,
+        height=detection.height,
+    )
+
+
+def rect_intersection_area(first: ImageRect, second: ImageRect) -> int:
+    left = max(first.x, second.x)
+    top = max(first.y, second.y)
+    right = min(first.right, second.right)
+    bottom = min(first.bottom, second.bottom)
+    return max(0, right - left) * max(0, bottom - top)
+
+
+def point_inside_rect(point: tuple[float, float], rect: ImageRect) -> bool:
+    x, y = point
+    return rect.x <= x <= rect.right and rect.y <= y <= rect.bottom
+
+
+def rect_distance(first: ImageRect, second: ImageRect) -> float:
+    dx = max(first.x - second.right, second.x - first.right, 0)
+    dy = max(first.y - second.bottom, second.y - first.bottom, 0)
+    return float((dx * dx + dy * dy) ** 0.5)
+
+
+def point_to_rect_distance(point: tuple[float, float], rect: ImageRect) -> float:
+    x, y = point
+    dx = max(rect.x - x, x - rect.right, 0.0)
+    dy = max(rect.y - y, y - rect.bottom, 0.0)
+    return float((dx * dx + dy * dy) ** 0.5)
+
+
+def clamp_score(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def person_relevance_score(
+    detection_rect: ImageRect,
+    *,
+    detection_score: float,
+    table_rect: ImageRect,
+    interaction_rect: ImageRect,
+    image_shape: tuple[int, ...],
+    temporal_coupling_score: float = 0.0,
+) -> dict[str, float]:
+    center = (detection_rect.x + detection_rect.width / 2.0, detection_rect.y + detection_rect.height / 2.0)
+    bottom_center = (center[0], float(detection_rect.bottom))
+    table_diagonal = max(1.0, float((table_rect.width * table_rect.width + table_rect.height * table_rect.height) ** 0.5))
+    halo_position_score = 0.0
+    if point_inside_rect(center, interaction_rect) or point_inside_rect(bottom_center, interaction_rect):
+        halo_position_score = clamp_score(1.0 - point_to_rect_distance(bottom_center, table_rect) / table_diagonal)
+
+    overlap_score = 0.0
+    if detection_rect.area > 0:
+        overlap_score = rect_intersection_area(detection_rect, table_rect) / detection_rect.area
+
+    proximity_score = clamp_score(1.0 - rect_distance(detection_rect, table_rect) / table_diagonal)
+    size_score = clamp_score(detection_rect.height / max(1.0, image_shape[0] * 0.12))
+    confidence_score = clamp_score(detection_score)
+
+    score = (
+        0.35 * halo_position_score
+        + 0.25 * clamp_score(overlap_score)
+        + 0.20 * proximity_score
+        + 0.10 * size_score
+        + 0.05 * confidence_score
+        + 0.05 * clamp_score(temporal_coupling_score)
+    )
+    return {
+        "score": round(clamp_score(score), 3),
+        "halo_position_score": round(halo_position_score, 3),
+        "overlap_score": round(clamp_score(overlap_score), 3),
+        "proximity_score": round(proximity_score, 3),
+        "size_score": round(size_score, 3),
+        "confidence_score": round(confidence_score, 3),
+        "temporal_coupling_score": round(clamp_score(temporal_coupling_score), 3),
+    }
+
+
+def estimate_relevant_person_signal(
+    *,
+    frame_image: np.ndarray,
+    table_roi: ROI | None,
+    person_mask_service: PersonMaskService,
+    sampling_config: DynamicVideoSamplingConfig,
+    temporal_coupling_score: float = 0.0,
+) -> dict[str, Any]:
+    if table_roi is None:
+        _, _, detections = person_mask_service.apply_black_mask(frame_image)
+        raw_person_count = len(detections)
+        return {
+            "raw_person_count": raw_person_count,
+            "relevant_person_count": raw_person_count,
+            "person_present": raw_person_count > 0,
+            "best_relevant_person_score": 1.0 if raw_person_count else 0.0,
+            "person_relevance_scores": [1.0 for _ in detections],
+            "person_relevance_reason": "roi_not_provided" if raw_person_count else "no_person",
+        }
+
+    table_rect = roi_to_rect(table_roi)
+    interaction_rect = expanded_interaction_rect(
+        table_rect,
+        frame_image.shape,
+        expand_x=sampling_config.interaction_halo_expand_x,
+        expand_y=sampling_config.interaction_halo_expand_y,
+    )
+    _, _, detections = person_mask_service.apply_black_mask(crop_rect(frame_image, interaction_rect))
+    scored_detections = [
+        person_relevance_score(
+            detection_to_frame_rect(detection, interaction_rect),
+            detection_score=detection.score,
+            table_rect=table_rect,
+            interaction_rect=interaction_rect,
+            image_shape=frame_image.shape,
+            temporal_coupling_score=temporal_coupling_score,
+        )
+        for detection in detections
+    ]
+    relevance_scores = [item["score"] for item in scored_detections]
+    best_score = max(relevance_scores, default=0.0)
+    relevant_count = sum(1 for score in relevance_scores if score >= sampling_config.person_relevant_threshold)
+
+    if relevant_count:
+        reason = "person_near_table"
+    elif best_score >= sampling_config.person_uncertain_threshold:
+        reason = "person_uncertain"
+    elif detections:
+        reason = "background_person_likely"
+    else:
+        reason = "no_person"
+
+    return {
+        "raw_person_count": len(detections),
+        "relevant_person_count": relevant_count,
+        "person_present": relevant_count > 0,
+        "best_relevant_person_score": round(best_score, 3),
+        "person_relevance_scores": relevance_scores,
+        "person_relevance_reason": reason,
+        "interaction_halo_bounds": {
+            "x": interaction_rect.x,
+            "y": interaction_rect.y,
+            "width": interaction_rect.width,
+            "height": interaction_rect.height,
+        },
+    }
 
 
 def build_workflow_frame_from_image(
@@ -144,6 +325,31 @@ class DynamicVideoSamplingConfig:
     max_observations: int = 60
     change_threshold: float = 0.12
     stable_threshold: float = 0.04
+    person_change_coupling_threshold: float = 0.08
+    person_relevant_threshold: float = 0.6
+    person_uncertain_threshold: float = 0.4
+    interaction_halo_expand_x: float = 0.75
+    interaction_halo_expand_y: float = 1.25
+
+
+@dataclass(frozen=True)
+class ImageRect:
+    x: int
+    y: int
+    width: int
+    height: int
+
+    @property
+    def right(self) -> int:
+        return self.x + self.width
+
+    @property
+    def bottom(self) -> int:
+        return self.y + self.height
+
+    @property
+    def area(self) -> int:
+        return max(0, self.width) * max(0, self.height)
 
 
 @dataclass
@@ -174,6 +380,7 @@ def sample_dynamic_video_workflow_frames(
     *,
     video_path: str | Path,
     max_frames: int = 10,
+    observation_budget: int | None = None,
     interaction_roi: ROI | None = None,
     person_mask_service: PersonMaskService | None = None,
     sampling_config: DynamicVideoSamplingConfig | None = None,
@@ -219,12 +426,13 @@ def sample_dynamic_video_workflow_frames(
     try:
         offset_seconds = 0.0
         observation_count = 0
+        resolved_observation_budget = max_frames if observation_budget is None else max(1, observation_budget)
         previous_crop: np.ndarray | None = None
         previous_person_present = False
         previous_state = "idle"
         samples: list[dict[str, Any]] = []
 
-        while len(samples) < max_frames and observation_count < config.max_observations:
+        while len(samples) < resolved_observation_budget and observation_count < config.max_observations:
             if resolved_duration_seconds is not None and offset_seconds > resolved_duration_seconds + 1e-6:
                 break
 
@@ -240,10 +448,18 @@ def sample_dynamic_video_workflow_frames(
             )
             frame_image = normalized_sample["image"]
             crop_image = crop_roi(frame_image, interaction_roi)
-            _, _, detections = occupancy_service.apply_black_mask(crop_image)
-            person_count = len(detections)
-            person_present = person_count > 0
             change_score = compute_frame_change_score(previous_crop, crop_image)
+            person_signal = estimate_relevant_person_signal(
+                frame_image=frame_image,
+                table_roi=interaction_roi,
+                person_mask_service=occupancy_service,
+                sampling_config=config,
+                temporal_coupling_score=1.0
+                if change_score >= config.person_change_coupling_threshold
+                else 0.0,
+            )
+            person_count = int(person_signal["relevant_person_count"])
+            person_present = bool(person_signal["person_present"])
             frame_type, sampling_state, reason_codes = classify_dynamic_frame(
                 previous_state=previous_state,
                 previous_person_present=previous_person_present,
@@ -273,6 +489,13 @@ def sample_dynamic_video_workflow_frames(
                         "change_score": round(change_score, 4),
                         "person_present": person_present,
                         "person_count": person_count,
+                        "raw_person_present": int(person_signal["raw_person_count"]) > 0,
+                        "raw_person_count": int(person_signal["raw_person_count"]),
+                        "relevant_person_count": person_count,
+                        "best_relevant_person_score": person_signal["best_relevant_person_score"],
+                        "person_relevance_scores": person_signal["person_relevance_scores"],
+                        "person_relevance_reason": person_signal["person_relevance_reason"],
+                        "interaction_halo_bounds": person_signal.get("interaction_halo_bounds"),
                     },
                 }
             )
@@ -594,6 +817,8 @@ def dynamic_frame_state_priority(frame_type: str) -> float:
 
 def summarize_dynamic_video_samples(
     samples: Sequence[dict[str, Any]],
+    *,
+    target_count: int | None = None,
 ) -> dict[str, Any]:
     episodes: list[DynamicSamplingEpisodeSummary] = []
     current_episode: DynamicSamplingEpisodeSummary | None = None
@@ -658,30 +883,27 @@ def summarize_dynamic_video_samples(
         ):
             current_episode = None
 
-    selected_indices: list[int] = []
-    for episode in episodes:
-        for index in episode.selected_indices():
-            if index not in selected_indices:
-                selected_indices.append(index)
-
-    if not selected_indices and samples:
-        fallback_indices = top_sample_indices(samples, list(range(len(samples))), limit=min(3, len(samples)))
-        selected_indices.extend(fallback_indices)
-
-    selected_indices = sorted(selected_indices)
+    sample_count = len(samples)
+    resolved_target_count = sample_count if target_count is None else max(1, min(sample_count, target_count))
+    selected_indices, selection_reasons_by_index = select_high_recall_sample_indices(
+        samples,
+        episodes,
+        target_count=resolved_target_count,
+    )
     selected_index_set = set(selected_indices)
     debug_trace: list[dict[str, Any]] = []
     for index, sample in enumerate(samples):
         debug_sample = dict(sample)
         debug_sample["selected_for_review"] = index in selected_index_set
         debug_sample["episode_id"] = sample_episode_id(episodes, index)
+        debug_sample["selection_reasons"] = sorted(selection_reasons_by_index.get(index, set()))
         debug_trace.append(debug_sample)
 
     return {
         "debug_trace": debug_trace,
         "selected_samples": [debug_trace[index] for index in selected_indices],
         "events": build_dynamic_sampling_events(debug_trace, episodes),
-        "episodes": build_dynamic_sampling_episodes(debug_trace, episodes),
+        "episodes": build_dynamic_sampling_episodes(debug_trace, episodes, selected_index_set),
     }
 
 
@@ -723,6 +945,176 @@ def top_sample_indices(
     return sorted(ranked[:limit])
 
 
+def select_high_recall_sample_indices(
+    samples: Sequence[dict[str, Any]],
+    episodes: Sequence[DynamicSamplingEpisodeSummary],
+    *,
+    target_count: int,
+) -> tuple[list[int], dict[int, set[str]]]:
+    selection_reasons_by_index: dict[int, set[str]] = {}
+
+    def add_index(index: int | None, reason: str) -> None:
+        if index is None or index < 0 or index >= len(samples):
+            return
+        selection_reasons_by_index.setdefault(index, set()).add(reason)
+
+    for episode in episodes:
+        add_index(episode.occupied_index, "episode_start")
+        if episode.meal_end_index is not None:
+            add_index(last_occupied_index_before(samples, episode, episode.meal_end_index), "pre_exit_anchor")
+            add_index(episode.meal_end_index, "episode_end")
+        for index in episode.cleaning_candidate_indices:
+            add_index(index, "post_exit_change")
+        add_index(episode.post_check_index, "post_exit_stable")
+
+    transition_indices = [
+        index
+        for episode in episodes
+        for index in [
+            episode.meal_end_index,
+            *episode.cleaning_candidate_indices,
+            episode.post_check_index,
+        ]
+        if index is not None
+    ]
+    for index in transition_indices:
+        add_index(index - 1, "transition_context")
+        add_index(index + 1, "transition_context")
+
+    selected_indices = sorted(selection_reasons_by_index)
+    if not samples:
+        return selected_indices, selection_reasons_by_index
+
+    episode_count = len(episodes)
+    minimum_recall_target = min(
+        target_count,
+        max(4, (episode_count * 3) if episode_count else min(len(samples), 3)),
+    )
+    peak_cap = min(
+        max(2, episode_count * 2) if episode_count else 3,
+        max(0, target_count - len(selected_indices)),
+        10,
+    )
+    coverage_cap = min(
+        max(2, episode_count + 1) if episode_count else 2,
+        max(0, target_count - len(selected_indices)),
+        6,
+    )
+
+    added_peak_count = 0
+    for index in rank_change_peak_indices(samples):
+        if len(selected_indices) >= target_count or added_peak_count >= peak_cap:
+            break
+        if index in selection_reasons_by_index:
+            continue
+        add_index(index, "change_peak")
+        added_peak_count += 1
+        selected_indices = sorted(selection_reasons_by_index)
+
+    added_coverage_count = 0
+    coverage_target = min(len(samples), max(target_count, coverage_cap))
+    for index in evenly_spaced_indices(len(samples), coverage_target):
+        if len(selected_indices) >= target_count or added_coverage_count >= coverage_cap:
+            break
+        if index in selection_reasons_by_index:
+            continue
+        add_index(index, "coverage")
+        added_coverage_count += 1
+        selected_indices = sorted(selection_reasons_by_index)
+
+    if len(selected_indices) < minimum_recall_target:
+        for index in rank_priority_indices(samples):
+            if len(selected_indices) >= minimum_recall_target:
+                break
+            if index in selection_reasons_by_index:
+                continue
+            add_index(index, "priority_fill")
+            selected_indices = sorted(selection_reasons_by_index)
+
+    if not selected_indices:
+        fallback_indices = top_sample_indices(samples, list(range(len(samples))), limit=min(target_count, len(samples)))
+        for index in fallback_indices:
+            add_index(index, "fallback")
+        selected_indices = sorted(selection_reasons_by_index)
+
+    return selected_indices, selection_reasons_by_index
+
+
+def last_occupied_index_before(
+    samples: Sequence[dict[str, Any]],
+    episode: DynamicSamplingEpisodeSummary,
+    boundary_index: int,
+) -> int | None:
+    for index in reversed(episode.sample_indices):
+        if index >= boundary_index:
+            continue
+        features = samples[index].get("features", {})
+        if bool(features.get("person_present", False)):
+            return index
+    return None
+
+
+def rank_change_peak_indices(samples: Sequence[dict[str, Any]]) -> list[int]:
+    ranked_candidates = sorted(
+        (
+            index
+            for index in range(len(samples))
+            if is_local_change_peak(samples, index)
+            and sample_change_score(samples[index]) >= 0.08
+        ),
+        key=lambda index: (
+            sample_change_score(samples[index]),
+            float(samples[index].get("priority", 0.0)),
+            float(samples[index].get("offset_seconds", 0.0)),
+        ),
+        reverse=True,
+    )
+
+    selected: list[int] = []
+    for index in ranked_candidates:
+        if any(abs(index - chosen_index) <= 1 for chosen_index in selected):
+            continue
+        selected.append(index)
+    return selected
+
+
+def rank_priority_indices(samples: Sequence[dict[str, Any]]) -> list[int]:
+    return sorted(
+        range(len(samples)),
+        key=lambda index: (
+            float(samples[index].get("priority", 0.0)),
+            sample_change_score(samples[index]),
+            float(samples[index].get("offset_seconds", 0.0)),
+        ),
+        reverse=True,
+    )
+
+
+def evenly_spaced_indices(sample_count: int, target_count: int) -> list[int]:
+    if sample_count <= 0 or target_count <= 0:
+        return []
+    if target_count >= sample_count:
+        return list(range(sample_count))
+    indices: list[int] = []
+    for slot in range(target_count):
+        index = int(round(slot * (sample_count - 1) / max(1, target_count - 1)))
+        if not indices or index != indices[-1]:
+            indices.append(index)
+    return indices
+
+
+def is_local_change_peak(samples: Sequence[dict[str, Any]], index: int) -> bool:
+    current = sample_change_score(samples[index])
+    previous = sample_change_score(samples[index - 1]) if index > 0 else -1.0
+    following = sample_change_score(samples[index + 1]) if index + 1 < len(samples) else -1.0
+    return current >= previous and current >= following
+
+
+def sample_change_score(sample: dict[str, Any]) -> float:
+    features = sample.get("features", {})
+    return float(features.get("change_score", 0.0))
+
+
 def build_dynamic_sampling_events(
     samples: Sequence[dict[str, Any]],
     episodes: Sequence[DynamicSamplingEpisodeSummary],
@@ -750,6 +1142,7 @@ def build_dynamic_sampling_events(
 def build_dynamic_sampling_episodes(
     samples: Sequence[dict[str, Any]],
     episodes: Sequence[DynamicSamplingEpisodeSummary],
+    selected_index_set: set[int],
 ) -> list[dict[str, Any]]:
     serialized: list[dict[str, Any]] = []
     for episode in episodes:
@@ -762,7 +1155,7 @@ def build_dynamic_sampling_episodes(
                 "episode_id": episode.episode_id,
                 "start_timestamp_sec": round(float(samples[episode.start_index].get("offset_seconds", 0.0)), 2),
                 "sample_count": len(episode.sample_indices),
-                "selected_count": len(episode.selected_indices()),
+                "selected_count": sum(1 for index in episode.sample_indices if index in selected_index_set),
                 "occupied_at": sample_timestamp_value(occupied_sample),
                 "meal_end_at": sample_timestamp_value(meal_end_sample),
                 "cleaning_candidate_at": [

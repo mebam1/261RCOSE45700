@@ -437,13 +437,17 @@ def data_url(path: Path) -> str:
     return "/data/" + path.relative_to(DATA_DIR).as_posix()
 
 
-def workflow_video_sampling_config(interval_seconds: float, max_frames: int) -> DynamicVideoSamplingConfig:
+def workflow_video_observation_budget(candidate_cap: int) -> int:
+    return max(candidate_cap * 6, 24)
+
+
+def workflow_video_sampling_config(interval_seconds: float, observation_budget: int) -> DynamicVideoSamplingConfig:
     return DynamicVideoSamplingConfig(
         idle_interval_seconds=max(interval_seconds, 1.0),
         occupied_interval_seconds=max(1.0, min(interval_seconds, 5.0)),
         transition_interval_seconds=max(0.5, min(interval_seconds / 2.0, 2.0)),
         post_check_interval_seconds=max(1.0, min(interval_seconds / 2.0, 3.0)),
-        max_observations=max(max_frames * 6, 24),
+        max_observations=max(observation_budget, 1),
     )
 
 
@@ -469,6 +473,7 @@ def serialize_dynamic_video_candidate(
         "features": dict(sample.get("features", {})),
         "episode_id": sample.get("episode_id"),
         "selected_for_review": bool(sample.get("selected_for_review", False)),
+        "selection_reasons": list(sample.get("selection_reasons", [])),
     }
     crop_image = sample.get("crop_image")
     if crop_image is not None:
@@ -489,13 +494,27 @@ def sampler_metadata_payload(sample: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def apply_dynamic_sample_occupancy(frames: list[dict[str, Any]], samples: list[dict[str, Any]]) -> None:
+    for frame, sample in zip(frames, samples):
+        features = sample.get("features", {})
+        if "person_present" not in features:
+            continue
+        frame["person_present"] = bool(features.get("person_present", False))
+        frame["person_count"] = int(features.get("person_count", 0) or 0)
+        frame["occupancy_source"] = "dynamic_person_relevance"
+        reason = features.get("person_relevance_reason")
+        if reason:
+            frame["occupancy_reason_codes"] = [f"person_relevance:{reason}"]
+
+
 def serialize_dynamic_video_sampling_payload(
     samples: list[dict[str, Any]],
     *,
     table_id: str,
     captured_at_start: str,
+    candidate_budget: int | None = None,
 ) -> dict[str, Any]:
-    sampling_summary = summarize_dynamic_video_samples(samples)
+    sampling_summary = summarize_dynamic_video_samples(samples, target_count=candidate_budget)
     debug_trace = [
         serialize_dynamic_video_candidate(sample, captured_at_start=captured_at_start)
         for sample in sampling_summary["debug_trace"]
@@ -1549,15 +1568,17 @@ async def action_cleanliness_workflow_video_candidates(
         raise HTTPException(status_code=400, detail="max_frames must be greater than 0")
 
     interaction_roi = parse_interaction_roi_json(interaction_roi_json)
+    observation_budget = workflow_video_observation_budget(max_frames)
     with tempfile.TemporaryDirectory() as temp_dir_name:
         temp_dir = Path(temp_dir_name)
         video_path = save_upload(video_file, temp_dir, "workflow_video_candidates")
         samples = sample_dynamic_video_workflow_frames(
             video_path=video_path,
             max_frames=max_frames,
+            observation_budget=observation_budget,
             interaction_roi=interaction_roi,
             person_mask_service=person_mask_service,
-            sampling_config=workflow_video_sampling_config(interval_seconds, max_frames),
+            sampling_config=workflow_video_sampling_config(interval_seconds, observation_budget),
         )
 
     return JSONResponse(
@@ -1565,6 +1586,7 @@ async def action_cleanliness_workflow_video_candidates(
             samples,
             table_id=table_id,
             captured_at_start=captured_at_start,
+            candidate_budget=max_frames,
         )
     )
 
@@ -1678,12 +1700,14 @@ async def action_cleanliness_workflow_from_video(
         temp_dir = Path(temp_dir_name)
         video_path = save_upload(video_file, temp_dir, "workflow_video")
         if dynamic_sampling:
+            observation_budget = workflow_video_observation_budget(max_frames)
             samples = sample_dynamic_video_workflow_frames(
                 video_path=video_path,
                 max_frames=max_frames,
+                observation_budget=observation_budget,
                 interaction_roi=interaction_roi,
                 person_mask_service=person_mask_service,
-                sampling_config=workflow_video_sampling_config(interval_seconds, max_frames),
+                sampling_config=workflow_video_sampling_config(interval_seconds, observation_budget),
             )
         else:
             samples = sample_video_workflow_frames(
@@ -1719,6 +1743,8 @@ async def action_cleanliness_workflow_from_video(
             person_mask_service=person_mask_service,
             frame_extractor=lambda _path, **__: list(samples),
         )
+        if dynamic_sampling:
+            apply_dynamic_sample_occupancy(frames, list(samples))
     if len(frames) < 2:
         raise HTTPException(status_code=400, detail="at least two frames are required")
 
@@ -1737,6 +1763,7 @@ async def action_cleanliness_workflow_from_video(
                 samples,
                 table_id=table_id,
                 captured_at_start=captured_at_start,
+                candidate_budget=max_frames,
             )
         )
     return JSONResponse(response_payload)
