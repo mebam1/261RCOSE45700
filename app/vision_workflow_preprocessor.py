@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Sequence
@@ -144,6 +144,30 @@ class DynamicVideoSamplingConfig:
     max_observations: int = 60
     change_threshold: float = 0.12
     stable_threshold: float = 0.04
+
+
+@dataclass
+class DynamicSamplingEpisodeSummary:
+    episode_id: str
+    start_index: int
+    sample_indices: list[int] = field(default_factory=list)
+    occupied_index: int | None = None
+    meal_end_index: int | None = None
+    cleaning_candidate_indices: list[int] = field(default_factory=list)
+    post_check_index: int | None = None
+
+    def selected_indices(self) -> list[int]:
+        selected: list[int] = []
+        if self.occupied_index is not None:
+            selected.append(self.occupied_index)
+        if self.meal_end_index is not None and self.meal_end_index not in selected:
+            selected.append(self.meal_end_index)
+        for index in self.cleaning_candidate_indices[:2]:
+            if index not in selected:
+                selected.append(index)
+        if self.post_check_index is not None and self.post_check_index not in selected:
+            selected.append(self.post_check_index)
+        return selected
 
 
 def sample_dynamic_video_workflow_frames(
@@ -566,6 +590,196 @@ def dynamic_frame_state_priority(frame_type: str) -> float:
         "cleaning_candidate": 0.92,
         "post_check": 0.82,
     }.get(frame_type, 0.15)
+
+
+def summarize_dynamic_video_samples(
+    samples: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    episodes: list[DynamicSamplingEpisodeSummary] = []
+    current_episode: DynamicSamplingEpisodeSummary | None = None
+    episode_counter = 0
+
+    def begin_episode(index: int) -> DynamicSamplingEpisodeSummary:
+        nonlocal episode_counter
+        episode_counter += 1
+        episode = DynamicSamplingEpisodeSummary(
+            episode_id=f"episode_{episode_counter:02d}",
+            start_index=index,
+        )
+        episodes.append(episode)
+        return episode
+
+    for index, sample in enumerate(samples):
+        frame_type = str(sample.get("frame_type") or "")
+        sampling_state = str(sample.get("sampling_state") or "")
+        features = sample.get("features", {})
+        person_present = bool(features.get("person_present", False))
+
+        if current_episode is None and (
+            person_present
+            or frame_type in {"meal_end_candidate", "cleaning_before_candidate", "cleaning_candidate", "post_check"}
+            or sampling_state in {"occupied", "meal_end_candidate", "cleaning_candidate", "post_check"}
+        ):
+            current_episode = begin_episode(index)
+
+        if current_episode is None:
+            continue
+
+        current_episode.sample_indices.append(index)
+        if current_episode.occupied_index is None and frame_type == "occupied_representative":
+            current_episode.occupied_index = index
+        if frame_type in {"meal_end_candidate", "cleaning_before_candidate"}:
+            current_episode.meal_end_index = choose_higher_priority_index(
+                samples,
+                current_episode.meal_end_index,
+                index,
+            )
+        if frame_type == "cleaning_candidate":
+            current_episode.cleaning_candidate_indices.append(index)
+            current_episode.cleaning_candidate_indices = top_sample_indices(
+                samples,
+                current_episode.cleaning_candidate_indices,
+                limit=2,
+            )
+        if frame_type == "post_check":
+            current_episode.post_check_index = choose_higher_priority_index(
+                samples,
+                current_episode.post_check_index,
+                index,
+            )
+            current_episode = None
+            continue
+
+        if (
+            not person_present
+            and frame_type == "periodic_sample"
+            and current_episode.meal_end_index is not None
+            and current_episode.post_check_index is None
+        ):
+            current_episode = None
+
+    selected_indices: list[int] = []
+    for episode in episodes:
+        for index in episode.selected_indices():
+            if index not in selected_indices:
+                selected_indices.append(index)
+
+    if not selected_indices and samples:
+        fallback_indices = top_sample_indices(samples, list(range(len(samples))), limit=min(3, len(samples)))
+        selected_indices.extend(fallback_indices)
+
+    selected_indices = sorted(selected_indices)
+    selected_index_set = set(selected_indices)
+    debug_trace: list[dict[str, Any]] = []
+    for index, sample in enumerate(samples):
+        debug_sample = dict(sample)
+        debug_sample["selected_for_review"] = index in selected_index_set
+        debug_sample["episode_id"] = sample_episode_id(episodes, index)
+        debug_trace.append(debug_sample)
+
+    return {
+        "debug_trace": debug_trace,
+        "selected_samples": [debug_trace[index] for index in selected_indices],
+        "events": build_dynamic_sampling_events(debug_trace, episodes),
+        "episodes": build_dynamic_sampling_episodes(debug_trace, episodes),
+    }
+
+
+def sample_episode_id(episodes: Sequence[DynamicSamplingEpisodeSummary], sample_index: int) -> str | None:
+    for episode in episodes:
+        if sample_index in episode.sample_indices:
+            return episode.episode_id
+    return None
+
+
+def choose_higher_priority_index(
+    samples: Sequence[dict[str, Any]],
+    current_index: int | None,
+    candidate_index: int,
+) -> int:
+    if current_index is None:
+        return candidate_index
+    current_priority = float(samples[current_index].get("priority", 0.0))
+    candidate_priority = float(samples[candidate_index].get("priority", 0.0))
+    if candidate_priority > current_priority:
+        return candidate_index
+    return current_index
+
+
+def top_sample_indices(
+    samples: Sequence[dict[str, Any]],
+    indices: Sequence[int],
+    *,
+    limit: int,
+) -> list[int]:
+    ranked = sorted(
+        dict.fromkeys(indices),
+        key=lambda index: (
+            float(samples[index].get("priority", 0.0)),
+            float(samples[index].get("offset_seconds", 0.0)),
+        ),
+        reverse=True,
+    )
+    return sorted(ranked[:limit])
+
+
+def build_dynamic_sampling_events(
+    samples: Sequence[dict[str, Any]],
+    episodes: Sequence[DynamicSamplingEpisodeSummary],
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    for episode in episodes:
+        event_indices = episode.selected_indices()
+        for index in event_indices:
+            sample = samples[index]
+            if sample.get("frame_type") == "occupied_representative" and episode.meal_end_index is None:
+                continue
+            events.append(
+                {
+                    "episode_id": episode.episode_id,
+                    "frame_type": sample.get("frame_type"),
+                    "sampling_state": sample.get("sampling_state"),
+                    "timestamp_sec": round(float(sample.get("offset_seconds", 0.0)), 2),
+                    "priority": sample.get("priority"),
+                    "reason_codes": list(sample.get("reason_codes", [])),
+                }
+            )
+    return events
+
+
+def build_dynamic_sampling_episodes(
+    samples: Sequence[dict[str, Any]],
+    episodes: Sequence[DynamicSamplingEpisodeSummary],
+) -> list[dict[str, Any]]:
+    serialized: list[dict[str, Any]] = []
+    for episode in episodes:
+        occupied_sample = samples[episode.occupied_index] if episode.occupied_index is not None else None
+        meal_end_sample = samples[episode.meal_end_index] if episode.meal_end_index is not None else None
+        post_check_sample = samples[episode.post_check_index] if episode.post_check_index is not None else None
+        cleaning_samples = [samples[index] for index in episode.cleaning_candidate_indices]
+        serialized.append(
+            {
+                "episode_id": episode.episode_id,
+                "start_timestamp_sec": round(float(samples[episode.start_index].get("offset_seconds", 0.0)), 2),
+                "sample_count": len(episode.sample_indices),
+                "selected_count": len(episode.selected_indices()),
+                "occupied_at": sample_timestamp_value(occupied_sample),
+                "meal_end_at": sample_timestamp_value(meal_end_sample),
+                "cleaning_candidate_at": [
+                    sample_timestamp_value(sample)
+                    for sample in cleaning_samples
+                    if sample_timestamp_value(sample) is not None
+                ],
+                "post_check_at": sample_timestamp_value(post_check_sample),
+            }
+        )
+    return serialized
+
+
+def sample_timestamp_value(sample: dict[str, Any] | None) -> float | None:
+    if sample is None:
+        return None
+    return round(float(sample.get("offset_seconds", 0.0)), 2)
 
 
 def first_occupancy_candidate_started_at(

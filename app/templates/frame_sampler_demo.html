@@ -1,0 +1,191 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="section">
+  <div class="section-head">
+    <h1>Frame Sampler Demo</h1>
+    <p>Upload one short or long video, pick a saved Store/CCTV ROI, and preview meaningful frame candidates without running the action workflow.</p>
+  </div>
+</section>
+
+<section class="grid-two">
+  <section class="panel">
+    <form id="frame-sampler-form" class="stack-gap" enctype="multipart/form-data">
+      <label>
+        <span>Saved CCTV Setup</span>
+        <select id="sampler-config-select">
+          <option value="">Select</option>
+          {% for config in configs %}
+          <option value="{{ config.config_id }}">
+            {{ config.store_name }} / {{ config.cctv_nickname }}
+          </option>
+          {% endfor %}
+        </select>
+      </label>
+
+      <label>
+        <span>Saved ROI</span>
+        <select id="sampler-roi-select">
+          <option value="">Select a setup first</option>
+        </select>
+      </label>
+
+      <label>
+        <span>Table ID</span>
+        <input type="text" name="table_id" id="sampler-table-id" value="T06" required>
+      </label>
+
+      <label>
+        <span>Captured At Start</span>
+        <input type="text" name="captured_at_start" value="{{ captured_at_start }}" placeholder="YYYY-MM-DDTHH:mm:ss" required>
+      </label>
+
+      <label>
+        <span>Idle Interval Seconds</span>
+        <input type="number" name="interval_seconds" value="{{ interval_seconds }}" min="1" step="1" required>
+      </label>
+
+      <label>
+        <span>Candidate Cap</span>
+        <input type="number" name="max_frames" value="{{ max_frames }}" min="1" step="1" required>
+      </label>
+
+      <label>
+        <span>Interaction ROI JSON</span>
+        <textarea name="interaction_roi_json" id="sampler-roi-json" rows="8" placeholder='{"name":"T01","points":[{"x":0,"y":0},{"x":100,"y":0},{"x":100,"y":100},{"x":0,"y":100}]}'>{{ interaction_roi_json }}</textarea>
+      </label>
+
+      <label>
+        <span>Video</span>
+        <input type="file" name="video_file" accept=".mp4,.mov,.m4v,.avi,.webm,.mkv" required>
+      </label>
+
+      <button type="submit" class="primary-button">Preview Candidate Frames</button>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Sampler Result</h2>
+    </div>
+    <p class="helper" id="sampler-status">Run the sampler to inspect extracted candidate frames and metadata.</p>
+    <div id="sampler-candidate-grid" class="candidate-grid"></div>
+    <pre id="sampler-result-json" class="helper"></pre>
+  </section>
+</section>
+
+<script>
+  const samplerConfigs = {{ configs_payload|tojson }};
+  const samplerConfigSelect = document.getElementById("sampler-config-select");
+  const samplerRoiSelect = document.getElementById("sampler-roi-select");
+  const samplerRoiJson = document.getElementById("sampler-roi-json");
+  const samplerTableId = document.getElementById("sampler-table-id");
+
+  function renderSamplerCandidatePreview(candidates) {
+    const grid = document.getElementById("sampler-candidate-grid");
+    grid.innerHTML = "";
+    candidates.forEach((candidate) => {
+      const card = document.createElement("article");
+      card.className = "candidate-card";
+
+      if (candidate.preview_url) {
+        const image = document.createElement("img");
+        image.src = candidate.preview_url;
+        image.alt = `${candidate.frame_type} preview`;
+        card.appendChild(image);
+      }
+
+      const title = document.createElement("strong");
+      title.textContent = `${candidate.frame_type} @ ${candidate.timestamp_sec}s`;
+      card.appendChild(title);
+
+      const meta = document.createElement("p");
+      meta.className = "candidate-meta";
+      meta.textContent = `state=${candidate.sampling_state} priority=${candidate.priority}`;
+      card.appendChild(meta);
+
+      const reasons = document.createElement("p");
+      reasons.className = "candidate-meta";
+      reasons.textContent = `reasons: ${(candidate.reason_codes || []).join(", ")}`;
+      card.appendChild(reasons);
+
+      grid.appendChild(card);
+    });
+  }
+
+  function selectedSamplerConfig() {
+    return samplerConfigs.find((item) => item.config_id === samplerConfigSelect.value);
+  }
+
+  function syncSamplerRoiJson() {
+    const config = selectedSamplerConfig();
+    const selectedRoi = config && config.areas
+      ? config.areas.find((area) => area.name === samplerRoiSelect.value)
+      : null;
+    if (!selectedRoi) {
+      samplerRoiJson.value = "";
+      return;
+    }
+    samplerRoiJson.value = JSON.stringify(
+      {
+        name: selectedRoi.name,
+        points: selectedRoi.points || [],
+      },
+      null,
+      2,
+    );
+    samplerTableId.value = selectedRoi.name;
+  }
+
+  function renderSamplerRois() {
+    samplerRoiSelect.innerHTML = "";
+    const config = selectedSamplerConfig();
+    if (!config) {
+      const option = document.createElement("option");
+      option.value = "";
+      option.textContent = "Select a setup first";
+      samplerRoiSelect.appendChild(option);
+      syncSamplerRoiJson();
+      return;
+    }
+
+    config.areas.forEach((area, index) => {
+      const option = document.createElement("option");
+      option.value = area.name;
+      const pointSummary = (area.points || []).map((point) => `(${point.x}, ${point.y})`).join(" ");
+      option.textContent = `${index}: ${area.name} ${pointSummary}`;
+      if (index === 0) {
+        option.selected = true;
+      }
+      samplerRoiSelect.appendChild(option);
+    });
+    syncSamplerRoiJson();
+  }
+
+  samplerConfigSelect.addEventListener("change", renderSamplerRois);
+  samplerRoiSelect.addEventListener("change", syncSamplerRoiJson);
+  renderSamplerRois();
+
+  document.getElementById("frame-sampler-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const status = document.getElementById("sampler-status");
+    const result = document.getElementById("sampler-result-json");
+    status.textContent = "Running frame sampler...";
+    result.textContent = "";
+
+    const response = await fetch("/api/action-cleanliness/workflow-video-candidates", {
+      method: "POST",
+      body: new FormData(form),
+    });
+    const payload = await response.json();
+    result.textContent = JSON.stringify(payload, null, 2);
+    if (response.ok) {
+      status.textContent = `Sampler selected ${payload.candidate_count} candidate frames from ${payload.debug_trace_count || payload.candidate_count} observations.`;
+      renderSamplerCandidatePreview(payload.selected_candidates || payload.candidates || []);
+    } else {
+      status.textContent = `Sampler request failed (${response.status}).`;
+      renderSamplerCandidatePreview([]);
+    }
+  });
+</script>
+{% endblock %}

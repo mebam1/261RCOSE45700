@@ -108,6 +108,19 @@ def open_video_capture(video_path: Path) -> tuple[cv2.VideoCapture, Path | None]
     return capture, temp_copy
 
 
+def extract_first_video_frame(video_path: Path) -> np.ndarray:
+    capture, temp_copy = open_video_capture(video_path)
+    try:
+        success, frame = capture.read()
+        if not success or frame is None:
+            raise ValueError(f"cannot read first frame from video: {video_path}")
+        return frame
+    finally:
+        capture.release()
+        if temp_copy and temp_copy.exists():
+            temp_copy.unlink(missing_ok=True)
+
+
 def ordered_points(roi: ROI) -> np.ndarray:
     points = np.array(roi.point_pairs(), dtype=np.float32)
     if len({tuple(point) for point in points.tolist()}) != 4:

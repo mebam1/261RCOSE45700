@@ -245,8 +245,8 @@
     const payload = await response.json();
     result.textContent = JSON.stringify(payload, null, 2);
     if (response.ok) {
-      status.textContent = `Sampler returned ${payload.candidate_count} candidate frames.`;
-      renderCandidatePreview(payload.candidates || []);
+      status.textContent = `Sampler selected ${payload.candidate_count} candidate frames from ${payload.debug_trace_count || payload.candidate_count} observations.`;
+      renderCandidatePreview(payload.selected_candidates || payload.candidates || []);
     } else {
       status.textContent = `Preview failed (${response.status}).`;
       renderCandidatePreview([]);
