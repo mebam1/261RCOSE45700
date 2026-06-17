@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.mp4
 
 data/uploads/
 data/mobile_videos/
@@ -12,5 +13,21 @@ data/person_masks/
 data/mvp1.sqlite3
 data/poster_templates/*_poster_*
 
+simulator/output/
+
+frontend/node_modules/
+frontend/dist/
+frontend/android/.gradle/
+frontend/android/build/
+frontend/android/app/build/
+frontend/android/captures/
+frontend/android/local.properties
+
 inference.sh
 mobileclip2_b.ts
+/frontend/dist/
+
+# Dongwoo VLM classifier
+venv/
+**/venv/
+**/.env

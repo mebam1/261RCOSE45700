@@ -39,6 +39,7 @@ from app.cleanliness_metric import build_visual_payload_from_yolo_detections, no
 from app.config import (
     DATA_DIR,
     FRONTEND_DIR,
+    MOBILE_CORS_EXTRA_ORIGINS,
     MOBILE_VIDEO_DIR,
     MOBILE_VIDEO_UPLOAD_INTERVAL_SECONDS,
     OPENAI_API_KEY,
@@ -49,6 +50,7 @@ from app.config import (
 from app.database import (
     count_owner_accounts,
     fetch_cleanliness_filter_options,
+    fetch_cleanliness_result_by_job_id,
     fetch_cleanliness_results,
     fetch_cleanliness_store_summary,
     fetch_filter_options,
@@ -87,12 +89,32 @@ from app.yolo_module import yolo_module
 
 
 app = FastAPI(title="MVP1 Franchise Quality Monitor")
+
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost",
+    "https://localhost",
+    "capacitor://localhost",
+    "ionic://localhost",
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+    *MOBILE_CORS_EXTRA_ORIGINS,
+]
+CORS_ALLOWED_ORIGIN_REGEX = (
+    r"^(?:"
+    r"https?://(?:"
+    r"localhost|"
+    r"127(?:\.\d{1,3}){3}|"
+    r"10(?:\.\d{1,3}){3}|"
+    r"192\.168(?:\.\d{1,3}){2}|"
+    r"172\.(?:1[6-9]|2\d|3[0-1])(?:\.\d{1,3}){2}"
+    r")(?::\d{1,5})?|"
+    r"(?:capacitor|ionic)://localhost"
+    r")$"
+)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:8080",
-        "http://127.0.0.1:8080",
-    ],
+    allow_origins=CORS_ALLOWED_ORIGINS,
+    allow_origin_regex=CORS_ALLOWED_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -103,7 +125,7 @@ analysis_service = AnalysisService()
 person_mask_service = PersonMaskService()
 cleanliness_service = CleanlinessService()
 action_cleanliness_service = ActionCleanlinessService()
-video_cleanliness_service = VideoCleanlinessService()
+video_cleanliness_service = VideoCleanlinessService(person_mask_service=person_mask_service)
 workflow_yolo_helper = yolo_module()
 
 init_db()
@@ -585,6 +607,10 @@ def with_action_workflow_report_details(record: dict[str, Any]) -> dict[str, Any
     payload = dict(record)
     payload["action_workflow_details"] = action_workflow_report_details(record)
     return payload
+
+
+def form_flag_enabled(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "on", "yes"}
 
 
 def merge_report_filter_options(
@@ -1097,6 +1123,7 @@ def cleanliness_page(request: Request, config_id: str | None = Query(default=Non
             "selected_config": selected,
             "selected_roi_name": "",
             "selected_prompt_profile": DEFAULT_CLEANLINESS_PROMPT_PROFILE,
+            "selected_use_yolo": False,
         },
     )
 
@@ -1107,6 +1134,7 @@ async def cleanliness_upload(
     config_id: str = Form(...),
     roi_name: str = Form(...),
     prompt_profile: str = Form(default=DEFAULT_CLEANLINESS_PROMPT_PROFILE),
+    use_yolo: str = Form(default="false"),
     image_file: UploadFile = File(...),
 ) -> Any:
     try:
@@ -1126,12 +1154,16 @@ async def cleanliness_upload(
     source_path = save_upload(image_file, UPLOAD_DIR, stem)
     crop_path = save_analysis_crop(read_image(source_path), roi, stem)
     selected_prompt_profile = normalize_cleanliness_prompt_profile(prompt_profile)
+    use_yolo_flag = form_flag_enabled(use_yolo)
 
     try:
         result = cleanliness_service.inspect_image(
             source_path,
             inspected_path=crop_path,
             prompt_profile=selected_prompt_profile,
+            use_yolo=use_yolo_flag,
+            roi=roi,
+            output_stem=stem,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1147,21 +1179,33 @@ async def cleanliness_upload(
     payload["source_url"] = data_url(result.source_path)
     payload["crop_url"] = data_url(crop_path)
     payload["llm_input_url"] = data_url(result.inspected_path)
+    payload["llm_input_urls"] = [data_url(path) for path in result.llm_input_paths]
+    yolo_payload = result.yolo_payload or {}
+    crop_annotated_path = Path(str(yolo_payload.get("crop_annotated_path") or "")) if yolo_payload.get("crop_annotated_path") else None
+    source_annotated_path = Path(str(yolo_payload.get("source_annotated_path") or "")) if yolo_payload.get("source_annotated_path") else None
+    payload["crop_annotated_url"] = data_url(crop_annotated_path) if crop_annotated_path else ""
+    payload["source_annotated_url"] = data_url(source_annotated_path) if source_annotated_path else ""
+    payload["pipeline_label"] = "YOLO + LLM" if result.use_yolo else "LLM only"
+    payload["yolo_payload_pretty"] = json.dumps(result.yolo_payload, ensure_ascii=False, indent=2) if result.yolo_payload else ""
     save_cleanliness_record(
         analyzed_at=analyzed_at,
         config=config,
         roi=roi,
-        mode="object",
+        mode="object_yolo" if result.use_yolo else "object",
         decision=object_score_to_decision(result.score),
         score=result.score,
         confidence=result.confidence,
-        final_stage="object_based",
+        final_stage="object_based_yolo" if result.use_yolo else "object_based",
         summary=result.summary,
         source_path=result.source_path,
         crop_path=crop_path,
         exact_objects=result.exact_objects,
         estimated_objects=result.estimated_objects,
         findings=result.findings,
+        action_features={
+            "use_yolo": result.use_yolo,
+            "yolo_payload": result.yolo_payload or {},
+        },
     )
 
     configs = config_store.list_configs()
@@ -1177,6 +1221,7 @@ async def cleanliness_upload(
             "selected_config": config.to_dict(),
             "selected_roi_name": roi.name,
             "selected_prompt_profile": selected_prompt_profile,
+            "selected_use_yolo": use_yolo_flag,
             "cleanliness_result": payload,
         },
     )
@@ -1206,6 +1251,7 @@ def run_mobile_video_cleanliness_job(
     device_id: str,
     captured_at: str,
     upload_period_seconds: float | None,
+    enable_person_masking: bool,
 ) -> None:
     try:
         result = video_cleanliness_service.inspect_video(
@@ -1216,6 +1262,7 @@ def run_mobile_video_cleanliness_job(
             device_id=device_id,
             captured_at=captured_at,
             upload_period_seconds=upload_period_seconds,
+            enable_person_masking=enable_person_masking,
         )
         decision = object_score_to_decision(result.score)
         update_cleanliness_result(
@@ -1238,6 +1285,11 @@ def run_mobile_video_cleanliness_job(
                         "captured_at": captured_at,
                         "upload_period_seconds": upload_period_seconds,
                         "analysis_url": result.analysis_url,
+                        "person_masking_enabled": result.person_masking_enabled,
+                        "person_masking_applied": result.person_masking_applied,
+                        "person_count": result.person_count,
+                        "masked_pixel_ratio": result.masked_pixel_ratio,
+                        "person_masked_path": str(result.person_masked_path) if result.person_masked_path else "",
                     }
                 ),
             },
@@ -1262,6 +1314,8 @@ def run_mobile_video_cleanliness_job(
                         "device_id": device_id,
                         "captured_at": captured_at,
                         "upload_period_seconds": upload_period_seconds,
+                        "person_masking_enabled": enable_person_masking,
+                        "person_masking_applied": False,
                         "error": str(exc),
                     }
                 ),
@@ -1285,6 +1339,64 @@ def run_mobile_video_cleanliness_job(
         )
 
 
+def load_action_features(record: dict[str, Any]) -> dict[str, Any]:
+    try:
+        value = json.loads(record.get("action_features") or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def mobile_job_payload(job_id: str, record: dict[str, Any]) -> dict[str, Any]:
+    score = record.get("score")
+    final_stage = str(record.get("final_stage") or "")
+    if final_stage == "video_failed":
+        status = "failed"
+    elif final_stage == "queued":
+        status = "queued"
+    elif score is not None:
+        status = "completed"
+    else:
+        status = "processing"
+
+    low_score_threshold = 2
+    is_low_score = isinstance(score, (int, float)) and score <= low_score_threshold
+    action_features = load_action_features(record)
+    return {
+        "job_id": job_id,
+        "status": status,
+        "analyzed_at": record.get("analyzed_at"),
+        "store_name": record.get("store_name"),
+        "cctv_id": record.get("cctv_id"),
+        "cctv_nickname": record.get("cctv_nickname"),
+        "roi_name": record.get("roi_name"),
+        "mode": record.get("mode"),
+        "final_stage": final_stage,
+        "decision": record.get("decision"),
+        "score": score,
+        "confidence": record.get("confidence"),
+        "summary": record.get("summary"),
+        "is_low_score": is_low_score,
+        "low_score_threshold": low_score_threshold,
+        "person_masking_enabled": action_features.get("person_masking_enabled") is True,
+        "person_masking_applied": action_features.get("person_masking_applied") is True,
+        "person_count": action_features.get("person_count") or 0,
+        "masked_pixel_ratio": action_features.get("masked_pixel_ratio") or 0.0,
+    }
+
+
+@app.get("/api/mobile/jobs/{job_id}")
+def mobile_cleanliness_job_result(
+    job_id: str,
+    owner_id: str = Depends(current_owner_id),
+) -> dict[str, Any]:
+    _ = owner_id
+    record = fetch_cleanliness_result_by_job_id(job_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    return mobile_job_payload(job_id, record)
+
+
 @app.post("/api/mobile/cleanliness-video")
 async def mobile_cleanliness_video_upload(
     background_tasks: BackgroundTasks,
@@ -1295,6 +1407,7 @@ async def mobile_cleanliness_video_upload(
     device_id: str = Form(default=""),
     captured_at: str = Form(default=""),
     upload_period_seconds: float | None = Form(default=None),
+    enable_person_masking: bool = Form(default=False),
     video_file: UploadFile = File(...),
 ) -> JSONResponse:
     _ = owner_id
@@ -1335,6 +1448,8 @@ async def mobile_cleanliness_video_upload(
             "captured_at": captured_at,
             "upload_period_seconds": upload_period_seconds,
             "prompt_profile": prompt_profile,
+            "person_masking_enabled": enable_person_masking,
+            "person_masking_applied": False,
         },
     )
 
@@ -1350,6 +1465,7 @@ async def mobile_cleanliness_video_upload(
         device_id=device_id,
         captured_at=captured_at,
         upload_period_seconds=upload_period_seconds,
+        enable_person_masking=enable_person_masking,
     )
     return JSONResponse({"job_id": job_id}, status_code=202)
 

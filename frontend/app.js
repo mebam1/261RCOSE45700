@@ -13,13 +13,26 @@ const state = {
   roiDragStart: null,
   authToken: window.localStorage.getItem("mobile-cleanliness-auth-token") || "",
   authMode: "login",
+  latestJobId: "",
+  lowScoreNotifiedJobIds: new Set(),
+  notificationChannelReady: false,
+  notificationPermissionRequested: false,
 };
+
+const JOB_POLL_INTERVAL_MS = 3000;
+const JOB_POLL_MAX_ATTEMPTS = 80;
+const APP_CONFIG = window.MOBILE_CLEANLINESS_CONFIG || {};
+const BACKEND_BASE_STORAGE_KEY = "mobile-cleanliness-backend-base";
+const LOW_SCORE_NOTIFICATION_STORAGE_KEY = "mobile-cleanliness-low-score-notified-jobs";
+const LOW_SCORE_NOTIFICATION_CHANNEL_ID = "low-score-alerts";
+const LOW_SCORE_NOTIFICATION_GROUP = "mvp1-low-score-alerts";
 
 const elements = {
   authPanel: document.getElementById("auth-panel"),
   appShell: document.getElementById("app-shell"),
   authForm: document.getElementById("auth-form"),
   authTitle: document.getElementById("auth-title"),
+  authBackendBaseInput: document.getElementById("auth-backend-base-input"),
   authUserIdInput: document.getElementById("auth-user-id-input"),
   authPasswordInput: document.getElementById("auth-password-input"),
   authSubmitButton: document.getElementById("auth-submit-button"),
@@ -41,6 +54,7 @@ const elements = {
   uploadIntervalInput: document.getElementById("upload-interval-input"),
   clipLengthInput: document.getElementById("clip-length-input"),
   promptProfileSelect: document.getElementById("prompt-profile-select"),
+  personMaskInput: document.getElementById("person-mask-input"),
   captureTabButton: document.getElementById("capture-tab-button"),
   roiTabButton: document.getElementById("roi-tab-button"),
   captureForm: document.getElementById("capture-form"),
@@ -60,6 +74,9 @@ const elements = {
   progressBar: document.getElementById("progress-bar"),
   currentUploadStatus: document.getElementById("current-upload-status"),
   lastUploadTime: document.getElementById("last-upload-time"),
+  lowScoreAlert: document.getElementById("low-score-alert"),
+  lowScoreMessage: document.getElementById("low-score-message"),
+  dismissLowScoreButton: document.getElementById("dismiss-low-score-button"),
   resultDecision: document.getElementById("result-decision"),
   resultScore: document.getElementById("result-score"),
   resultConfidence: document.getElementById("result-confidence"),
@@ -70,6 +87,9 @@ const elements = {
 };
 
 function defaultBackendBase() {
+  if (isNativeApp() && APP_CONFIG.nativeBackendBase) {
+    return APP_CONFIG.nativeBackendBase;
+  }
   if (window.location.protocol === "file:") {
     return "http://127.0.0.1:8000";
   }
@@ -80,8 +100,33 @@ function defaultBackendBase() {
   return window.location.origin;
 }
 
+function isNativeApp() {
+  return Boolean(window.Capacitor?.isNativePlatform?.());
+}
+
+function localNotificationsPlugin() {
+  return window.Capacitor?.Plugins?.LocalNotifications || null;
+}
+
+function backendBaseValue() {
+  return (
+    elements.backendBaseInput.value.trim()
+    || elements.authBackendBaseInput.value.trim()
+    || defaultBackendBase()
+  );
+}
+
+function setBackendBase(value, persist = true) {
+  const normalized = (value || "").trim() || defaultBackendBase();
+  elements.backendBaseInput.value = normalized;
+  elements.authBackendBaseInput.value = normalized;
+  if (persist) {
+    window.localStorage.setItem(BACKEND_BASE_STORAGE_KEY, normalized);
+  }
+}
+
 function buildApiUrl(path) {
-  const baseValue = elements.backendBaseInput.value.trim() || defaultBackendBase();
+  const baseValue = backendBaseValue();
   const baseUrl = baseValue.endsWith("/") ? baseValue : `${baseValue}/`;
   return new URL(path.replace(/^\//, ""), baseUrl).toString();
 }
@@ -170,6 +215,132 @@ function addLog(message, level = "info") {
   }
 }
 
+function loadLowScoreNotificationIds() {
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(LOW_SCORE_NOTIFICATION_STORAGE_KEY) || "[]");
+    return new Set(Array.isArray(stored) ? stored.map((value) => String(value)) : []);
+  } catch (error) {
+    return new Set();
+  }
+}
+
+function persistLowScoreNotificationIds() {
+  const ids = Array.from(state.lowScoreNotifiedJobIds).slice(-100);
+  state.lowScoreNotifiedJobIds = new Set(ids);
+  window.localStorage.setItem(LOW_SCORE_NOTIFICATION_STORAGE_KEY, JSON.stringify(ids));
+}
+
+function lowScoreNotificationKey(payload) {
+  const fallback = [
+    payload.store_name,
+    payload.cctv_id,
+    payload.roi_name,
+    payload.analyzed_at,
+    payload.score,
+  ].filter((value) => value !== undefined && value !== null && value !== "").join("|");
+  return String(payload.job_id || fallback || Date.now());
+}
+
+function notificationIdForLowScore(key) {
+  let hash = 0;
+  for (let index = 0; index < key.length; index += 1) {
+    hash = (Math.imul(31, hash) + key.charCodeAt(index)) | 0;
+  }
+  return 100000 + (Math.abs(hash) % 2000000000);
+}
+
+function markLowScoreNotificationSent(key) {
+  state.lowScoreNotifiedJobIds.add(key);
+  persistLowScoreNotificationIds();
+}
+
+async function ensureLowScoreNotificationChannel(plugin) {
+  if (state.notificationChannelReady || window.Capacitor?.getPlatform?.() !== "android") {
+    state.notificationChannelReady = true;
+    return;
+  }
+  await plugin.createChannel({
+    id: LOW_SCORE_NOTIFICATION_CHANNEL_ID,
+    name: "청결도 낮음 경고",
+    description: "분석 점수가 낮을 때 1회성 알림을 표시합니다.",
+    importance: 5,
+    visibility: 1,
+    lights: true,
+    lightColor: "#d92d20",
+    vibration: true,
+  });
+  state.notificationChannelReady = true;
+}
+
+async function ensureLowScoreNotificationPermission(plugin) {
+  let permission = await plugin.checkPermissions();
+  if (permission.display === "granted") {
+    return true;
+  }
+
+  if (state.notificationPermissionRequested) {
+    return false;
+  }
+
+  state.notificationPermissionRequested = true;
+  permission = await plugin.requestPermissions();
+  return permission.display === "granted";
+}
+
+async function notifyLowScoreOnce(payload) {
+  if (!isNativeApp()) {
+    return;
+  }
+
+  const plugin = localNotificationsPlugin();
+  if (!plugin) {
+    addLog("로컬 푸시 알림 플러그인을 찾을 수 없습니다.", "warning");
+    return;
+  }
+
+  const notificationKey = lowScoreNotificationKey(payload);
+  if (state.lowScoreNotifiedJobIds.has(notificationKey)) {
+    return;
+  }
+
+  try {
+    const hasPermission = await ensureLowScoreNotificationPermission(plugin);
+    if (!hasPermission) {
+      addLog("알림 권한이 없어 낮은 점수 푸시를 표시하지 못했습니다.", "warning");
+      return;
+    }
+
+    await ensureLowScoreNotificationChannel(plugin);
+    const scoreText = typeof payload.score === "number" ? `${payload.score} / 5` : "-";
+    const targetText = [payload.store_name, payload.roi_name].filter(Boolean).join(" · ") || "ROI";
+    const body = `${targetText} 점수 ${scoreText}. 즉시 확인이 필요합니다.`;
+
+    await plugin.schedule({
+      notifications: [
+        {
+          id: notificationIdForLowScore(notificationKey),
+          title: "청결도 낮음 경고",
+          body,
+          largeBody: body,
+          summaryText: "낮은 분석 점수",
+          channelId: LOW_SCORE_NOTIFICATION_CHANNEL_ID,
+          group: LOW_SCORE_NOTIFICATION_GROUP,
+          autoCancel: true,
+          extra: {
+            jobId: payload.job_id || "",
+            storeName: payload.store_name || "",
+            roiName: payload.roi_name || "",
+            score: payload.score,
+          },
+        },
+      ],
+    });
+    markLowScoreNotificationSent(notificationKey);
+  } catch (error) {
+    addLog(error.message || "낮은 점수 푸시 알림 전송 실패", "warning");
+  }
+}
+
 function setProgress(percent) {
   elements.progressBar.style.width = `${Math.max(0, Math.min(100, percent))}%`;
 }
@@ -186,6 +357,10 @@ function formatBytes(bytes) {
 
 function formatElapsed(startedAt) {
   return `${Math.max(0, Math.round((Date.now() - startedAt) / 1000))}초`;
+}
+
+function personMaskingLabel(values) {
+  return values.enablePersonMasking ? " · 사람 마스킹" : "";
 }
 
 function createUploadEvent(values) {
@@ -234,7 +409,11 @@ function createUploadEvent(values) {
     extra,
     values,
   };
-  updateUploadEvent(entry, "recording", `${values.configId} / ${values.roiName} · ${values.clipLengthSeconds}초 촬영`);
+  updateUploadEvent(
+    entry,
+    "recording",
+    `${values.configId} / ${values.roiName} · ${values.clipLengthSeconds}초 촬영${personMaskingLabel(values)}`,
+  );
   return entry;
 }
 
@@ -244,6 +423,7 @@ function updateUploadEvent(entry, status, detailText, extraText = "") {
     uploading: "업로드 중",
     accepted: "접수됨",
     success: "완료",
+    warning: "경고",
     error: "실패",
   };
   entry.item.className = `upload-event ${status}`;
@@ -303,15 +483,18 @@ function stopUploadLoop() {
 }
 
 function validateSecureContext() {
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    setStatus("브라우저가 카메라 스트림을 지원하지 않습니다.", "error");
-    elements.openCameraButton.disabled = true;
+  if (!isNativeApp() && !window.isSecureContext) {
+    setStatus("카메라는 HTTPS 주소 또는 localhost에서만 열 수 있습니다.", "error");
+    addLog(
+      `현재 주소(${window.location.origin})는 보안 컨텍스트가 아니어서 카메라 접근이 차단됩니다. HTTPS로 접속하세요.`,
+      "warning",
+    );
     return false;
   }
 
-  if (!window.isSecureContext) {
-    setStatus("카메라는 HTTPS 또는 localhost에서만 열 수 있습니다.", "error");
-    addLog("보안 컨텍스트가 아니어서 카메라 접근이 차단됩니다.", "warning");
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setStatus("브라우저가 카메라 스트림을 지원하지 않습니다.", "error");
+    elements.openCameraButton.disabled = true;
     return false;
   }
 
@@ -528,6 +711,7 @@ function selectedFormValues() {
     uploadIntervalSeconds,
     clipLengthSeconds: Math.min(clipLengthSeconds, uploadIntervalSeconds),
     promptProfile: elements.promptProfileSelect.value,
+    enablePersonMasking: elements.personMaskInput.checked,
     deviceId: elements.deviceIdInput.value.trim() || getOrCreateDeviceId(),
   };
 }
@@ -544,6 +728,7 @@ async function uploadClip({ blob, mimeType }, values) {
   formData.append("device_id", values.deviceId);
   formData.append("captured_at", capturedAt);
   formData.append("upload_period_seconds", String(values.uploadIntervalSeconds));
+  formData.append("enable_person_masking", values.enablePersonMasking ? "true" : "false");
   formData.append("video_file", blob, filename);
 
   const response = await apiFetch("/api/mobile/cleanliness-video", {
@@ -559,11 +744,28 @@ async function uploadClip({ blob, mimeType }, values) {
 
 function renderResult(payload) {
   elements.resultDecision.textContent = payload.decision || "-";
-  elements.resultScore.textContent = payload.score ? `${payload.score} / 5` : "-";
+  elements.resultScore.textContent =
+    typeof payload.score === "number" ? `${payload.score} / 5` : "-";
   elements.resultConfidence.textContent =
     typeof payload.confidence === "number" ? `${Math.round(payload.confidence * 100)}%` : "-";
-  elements.resultSummary.textContent = payload.summary || "-";
+  const maskSummary = payload.person_masking_enabled
+    ? `\n사람 마스킹 ${payload.person_masking_applied ? "적용" : "대기"} · 감지 ${payload.person_count || 0}명`
+    : "";
+  elements.resultSummary.textContent = `${payload.summary || "-"}${maskSummary}`;
   elements.lastUploadTime.textContent = new Date().toLocaleTimeString();
+}
+
+function hideLowScoreWarning() {
+  elements.lowScoreAlert.classList.add("hidden");
+}
+
+function showLowScoreWarning(payload) {
+  const scoreText = typeof payload.score === "number" ? `${payload.score} / 5` : "-";
+  const targetText = [payload.store_name, payload.roi_name].filter(Boolean).join(" · ");
+  elements.lowScoreMessage.textContent = `${targetText || "ROI"} 점수 ${scoreText}. 즉시 확인이 필요합니다.`;
+  elements.lowScoreAlert.classList.remove("hidden");
+  addLog(`청결도 경고: ${targetText || payload.job_id || "job"} 점수 ${scoreText}`, "warning");
+  notifyLowScoreOnce(payload);
 }
 
 function renderAcceptedJob(payload) {
@@ -572,6 +774,81 @@ function renderAcceptedJob(payload) {
   elements.resultConfidence.textContent = "-";
   elements.resultSummary.textContent = `job_id ${payload.job_id || "-"} 서버 분석 작업으로 접수됨`;
   elements.lastUploadTime.textContent = new Date().toLocaleTimeString();
+}
+
+function delay(ms) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
+async function fetchJobResult(jobId) {
+  const response = await apiFetch(`/api/mobile/jobs/${encodeURIComponent(jobId)}`);
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload.detail || `결과 조회 실패 ${response.status}`);
+  }
+  return payload;
+}
+
+async function pollJobResult(jobId, uploadEntry) {
+  for (let attempt = 0; attempt < JOB_POLL_MAX_ATTEMPTS; attempt += 1) {
+    await delay(attempt === 0 ? 1500 : JOB_POLL_INTERVAL_MS);
+    if (!state.authToken) {
+      return;
+    }
+
+    const payload = await fetchJobResult(jobId);
+    if (payload.status === "queued" || payload.status === "processing") {
+      updateUploadEvent(
+        uploadEntry,
+        "accepted",
+        `job_id ${jobId} · 분석 중`,
+        formatElapsed(uploadEntry.startedAt),
+      );
+      continue;
+    }
+
+    if (payload.status === "failed") {
+      if (state.latestJobId === jobId) {
+        renderResult(payload);
+      }
+      updateUploadEvent(
+        uploadEntry,
+        "error",
+        payload.summary || `job_id ${jobId} 분석 실패`,
+        formatElapsed(uploadEntry.startedAt),
+      );
+      addLog(`분석 실패: job_id ${jobId}`, "error");
+      return;
+    }
+
+    if (state.latestJobId === jobId) {
+      renderResult(payload);
+    }
+    const scoreText = typeof payload.score === "number" ? `${payload.score} / 5` : "-";
+    const eventStatus = payload.is_low_score ? "warning" : "success";
+    const maskText = payload.person_masking_enabled ? ` · 마스킹 ${payload.person_count || 0}명` : "";
+    updateUploadEvent(
+      uploadEntry,
+      eventStatus,
+      `${payload.roi_name || "ROI"} · 점수 ${scoreText} · ${payload.decision || "-"}${maskText}`,
+      formatElapsed(uploadEntry.startedAt),
+    );
+    if (payload.is_low_score) {
+      showLowScoreWarning(payload);
+    } else {
+      addLog(`분석 완료: job_id ${jobId} 점수 ${scoreText}`, "success");
+    }
+    return;
+  }
+
+  updateUploadEvent(
+    uploadEntry,
+    "accepted",
+    `job_id ${jobId} · 분석 결과 대기 중`,
+    formatElapsed(uploadEntry.startedAt),
+  );
 }
 
 function startProgress(durationMs) {
@@ -613,7 +890,7 @@ async function runUploadCycle() {
     updateUploadEvent(
       uploadEntry,
       "recording",
-      `${values.configId} / ${values.roiName} · ${values.clipLengthSeconds}초 촬영 중`,
+      `${values.configId} / ${values.roiName} · ${values.clipLengthSeconds}초 촬영 중${personMaskingLabel(values)}`,
     );
     startProgress(clipMs);
     const clip = await recordClip(clipMs);
@@ -622,12 +899,13 @@ async function runUploadCycle() {
     updateUploadEvent(
       uploadEntry,
       "uploading",
-      `${values.configId} / ${values.roiName} · ${formatBytes(clip.blob.size)} 업로드 중`,
+      `${values.configId} / ${values.roiName} · ${formatBytes(clip.blob.size)} 업로드 중${personMaskingLabel(values)}`,
       formatElapsed(uploadEntry.startedAt),
     );
     const payload = await uploadClip(clip, values);
     state.uploadCount += 1;
     elements.uploadCount.textContent = `${state.uploadCount}회`;
+    state.latestJobId = payload.job_id || "";
     renderAcceptedJob(payload);
     setStatus("분석 작업 접수", "success");
     updateUploadEvent(
@@ -637,6 +915,17 @@ async function runUploadCycle() {
       formatElapsed(uploadEntry.startedAt),
     );
     addLog(`업로드 접수: job_id ${payload.job_id || "-"}`, "success");
+    if (payload.job_id) {
+      pollJobResult(payload.job_id, uploadEntry).catch((error) => {
+        updateUploadEvent(
+          uploadEntry,
+          "error",
+          error.message || "분석 결과 조회 실패",
+          formatElapsed(uploadEntry.startedAt),
+        );
+        addLog(error.message || "분석 결과 조회 실패", "error");
+      });
+    }
   } catch (error) {
     setStatus(error.message || "업로드 실패", "error");
     updateUploadEvent(
@@ -1041,6 +1330,8 @@ async function submitAuth(event) {
 
 function bindEvents() {
   elements.authForm.addEventListener("submit", submitAuth);
+  elements.authBackendBaseInput.addEventListener("change", () => setBackendBase(elements.authBackendBaseInput.value));
+  elements.backendBaseInput.addEventListener("change", () => setBackendBase(elements.backendBaseInput.value));
   elements.logoutButton.addEventListener("click", () => handleLogout());
   elements.loadPolicyButton.addEventListener("click", async () => {
     try {
@@ -1069,6 +1360,7 @@ function bindEvents() {
   elements.openCameraButton.addEventListener("click", openCamera);
   elements.startUploadButton.addEventListener("click", startUploadLoop);
   elements.stopButton.addEventListener("click", stopAll);
+  elements.dismissLowScoreButton.addEventListener("click", hideLowScoreWarning);
   elements.clearLogButton.addEventListener("click", () => {
     elements.logList.innerHTML = "";
   });
@@ -1078,7 +1370,8 @@ function bindEvents() {
 }
 
 function init() {
-  elements.backendBaseInput.value = defaultBackendBase();
+  state.lowScoreNotifiedJobIds = loadLowScoreNotificationIds();
+  setBackendBase(window.localStorage.getItem(BACKEND_BASE_STORAGE_KEY) || defaultBackendBase(), false);
   elements.deviceIdInput.value = getOrCreateDeviceId();
   bindEvents();
   showAuthPanel("login");
