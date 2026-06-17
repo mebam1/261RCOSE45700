@@ -408,21 +408,170 @@ class VisionWorkflowPreprocessorTest(unittest.TestCase):
             },
         ]
 
-        summary = summarize_dynamic_video_samples(samples)
+        summary = summarize_dynamic_video_samples(samples, target_count=5)
 
         self.assertEqual(len(summary["debug_trace"]), 5)
         self.assertEqual(
             [sample["frame_type"] for sample in summary["selected_samples"]],
             [
                 "occupied_representative",
+                "occupied_representative",
                 "meal_end_candidate",
                 "cleaning_candidate",
                 "post_check",
             ],
         )
-        self.assertFalse(summary["debug_trace"][1]["selected_for_review"])
+        self.assertIn("pre_exit_anchor", summary["debug_trace"][1]["selection_reasons"])
         self.assertEqual(len(summary["episodes"]), 1)
         self.assertEqual(summary["episodes"][0]["meal_end_at"], 10.0)
+
+    def test_dynamic_video_sampler_can_observe_more_than_candidate_cap(self) -> None:
+        frames_by_offset = {
+            0.0: np.zeros((16, 16, 3), dtype=np.uint8),
+            5.0: np.zeros((16, 16, 3), dtype=np.uint8),
+            10.0: np.zeros((16, 16, 3), dtype=np.uint8),
+            11.0: np.ones((16, 16, 3), dtype=np.uint8),
+            12.0: np.ones((16, 16, 3), dtype=np.uint8),
+            14.0: np.ones((16, 16, 3), dtype=np.uint8),
+        }
+
+        def fake_reader(offset_seconds: float) -> dict[str, object] | None:
+            image = frames_by_offset.get(round(offset_seconds, 1))
+            if image is None:
+                return None
+            return {
+                "image": image.copy(),
+                "offset_seconds": float(round(offset_seconds, 1)),
+                "fps": 1.0,
+                "frame_index": int(round(offset_seconds)),
+            }
+
+        samples = sample_dynamic_video_workflow_frames(
+            video_path="demo.avi",
+            max_frames=2,
+            observation_budget=6,
+            person_mask_service=FakePersonMaskService(
+                [
+                    [PersonDetection(x=0, y=0, width=4, height=4, score=0.9, source="fake")],
+                    [PersonDetection(x=0, y=0, width=4, height=4, score=0.9, source="fake")],
+                    [],
+                    [PersonDetection(x=0, y=0, width=4, height=4, score=0.9, source="fake")],
+                    [],
+                    [],
+                ]
+            ),
+            sampling_config=DynamicVideoSamplingConfig(
+                idle_interval_seconds=10.0,
+                occupied_interval_seconds=5.0,
+                transition_interval_seconds=1.0,
+                post_check_interval_seconds=2.0,
+                max_observations=6,
+                change_threshold=0.12,
+                stable_threshold=0.04,
+            ),
+            frame_reader=fake_reader,
+            duration_seconds=15.0,
+        )
+
+        self.assertEqual(len(samples), 6)
+        self.assertEqual([sample["offset_seconds"] for sample in samples], [0.0, 5.0, 10.0, 11.0, 12.0, 14.0])
+
+    def test_dynamic_video_sampler_treats_far_halo_person_as_background(self) -> None:
+        roi = ROI.from_rectangle("TABLE_1", 50, 50, 20, 20)
+
+        def fake_reader(offset_seconds: float) -> dict[str, object] | None:
+            if offset_seconds > 0:
+                return None
+            return {
+                "image": np.zeros((120, 120, 3), dtype=np.uint8),
+                "offset_seconds": 0.0,
+                "fps": 1.0,
+                "frame_index": 0,
+            }
+
+        samples = sample_dynamic_video_workflow_frames(
+            video_path="demo.avi",
+            max_frames=1,
+            observation_budget=1,
+            interaction_roi=roi,
+            person_mask_service=FakePersonMaskService(
+                [[PersonDetection(x=0, y=0, width=5, height=5, score=0.9, source="fake")]]
+            ),
+            sampling_config=DynamicVideoSamplingConfig(max_observations=1),
+            frame_reader=fake_reader,
+            duration_seconds=1.0,
+        )
+
+        self.assertEqual(samples[0]["features"]["raw_person_count"], 1)
+        self.assertFalse(samples[0]["features"]["person_present"])
+        self.assertEqual(samples[0]["features"]["person_count"], 0)
+        self.assertEqual(samples[0]["features"]["person_relevance_reason"], "background_person_likely")
+        self.assertLess(samples[0]["features"]["best_relevant_person_score"], 0.6)
+
+    def test_dynamic_video_sampler_marks_near_table_person_as_relevant(self) -> None:
+        roi = ROI.from_rectangle("TABLE_1", 50, 50, 20, 20)
+        frames_by_offset = {
+            0.0: np.zeros((120, 120, 3), dtype=np.uint8),
+            5.0: np.zeros((120, 120, 3), dtype=np.uint8),
+        }
+
+        def fake_reader(offset_seconds: float) -> dict[str, object] | None:
+            image = frames_by_offset.get(round(offset_seconds, 1))
+            if image is None:
+                return None
+            return {
+                "image": image.copy(),
+                "offset_seconds": float(round(offset_seconds, 1)),
+                "fps": 1.0,
+                "frame_index": int(round(offset_seconds)),
+            }
+
+        samples = sample_dynamic_video_workflow_frames(
+            video_path="demo.avi",
+            max_frames=2,
+            observation_budget=2,
+            interaction_roi=roi,
+            person_mask_service=FakePersonMaskService(
+                [
+                    [PersonDetection(x=20, y=25, width=15, height=30, score=0.9, source="fake")],
+                    [PersonDetection(x=20, y=25, width=15, height=30, score=0.9, source="fake")],
+                ]
+            ),
+            sampling_config=DynamicVideoSamplingConfig(max_observations=2),
+            frame_reader=fake_reader,
+            duration_seconds=6.0,
+        )
+
+        self.assertEqual(samples[0]["frame_type"], "occupied_representative")
+        self.assertTrue(samples[0]["features"]["person_present"])
+        self.assertEqual(samples[0]["features"]["person_count"], 1)
+        self.assertEqual(samples[0]["features"]["person_relevance_reason"], "person_near_table")
+        self.assertGreaterEqual(samples[0]["features"]["best_relevant_person_score"], 0.6)
+
+    def test_dynamic_video_sampler_summary_uses_target_count_as_upper_bound(self) -> None:
+        samples = [
+            {
+                "image": np.zeros((24, 24, 3), dtype=np.uint8),
+                "crop_image": np.zeros((16, 16, 3), dtype=np.uint8),
+                "offset_seconds": float(index * 5),
+                "frame_type": "periodic_sample",
+                "sampling_state": "idle",
+                "priority": 0.15,
+                "reason_codes": ["periodic_sample"],
+                "features": {"change_score": 0.0, "person_present": False, "person_count": 0},
+            }
+            for index in range(12)
+        ]
+
+        summary = summarize_dynamic_video_samples(samples, target_count=20)
+
+        self.assertEqual(len(summary["debug_trace"]), 12)
+        self.assertEqual(len(summary["selected_samples"]), 4)
+        self.assertLess(len(summary["selected_samples"]), len(samples))
+        self.assertEqual(
+            sorted({reason for sample in summary["selected_samples"] for reason in sample["selection_reasons"]}),
+            ["coverage", "priority_fill"],
+        )
 
     def test_video_generated_frames_can_form_long_dwell_sequence(self) -> None:
         def fake_extractor(video_path, *, interval_seconds, max_frames):

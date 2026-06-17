@@ -196,10 +196,21 @@
       meta.textContent = `state=${candidate.sampling_state} priority=${candidate.priority}`;
       card.appendChild(meta);
 
-      const reasons = document.createElement("p");
-      reasons.className = "candidate-meta";
-      reasons.textContent = `reasons: ${(candidate.reason_codes || []).join(", ")}`;
-      card.appendChild(reasons);
+    const reasons = document.createElement("p");
+    reasons.className = "candidate-meta";
+    reasons.textContent = `reasons: ${(candidate.reason_codes || []).join(", ")}`;
+    card.appendChild(reasons);
+
+    const personSignal = document.createElement("p");
+    const features = candidate.features || {};
+    personSignal.className = "candidate-meta";
+    personSignal.textContent = `person: raw=${features.raw_person_count ?? features.person_count ?? 0} relevant=${features.relevant_person_count ?? features.person_count ?? 0} score=${features.best_relevant_person_score ?? "n/a"} ${features.person_relevance_reason || ""}`;
+    card.appendChild(personSignal);
+
+    const selectionReasons = document.createElement("p");
+    selectionReasons.className = "candidate-meta";
+    selectionReasons.textContent = `selected by: ${(candidate.selection_reasons || []).join(", ")}`;
+    card.appendChild(selectionReasons);
 
       grid.appendChild(card);
     });

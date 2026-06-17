@@ -413,17 +413,19 @@ class ActionWorkflowDemoTest(unittest.TestCase):
 
         payload = response.json()
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(payload["candidate_count"], 1)
+        self.assertEqual(payload["candidate_count"], 2)
         self.assertEqual(payload["debug_trace_count"], 2)
-        self.assertEqual(payload["selected_candidates"][0]["frame_type"], "meal_end_candidate")
-        self.assertTrue(payload["selected_candidates"][0]["preview_url"].startswith("data:image/"))
+        self.assertEqual(payload["selected_candidates"][0]["frame_type"], "periodic_sample")
+        self.assertEqual(payload["selected_candidates"][1]["frame_type"], "meal_end_candidate")
+        self.assertTrue(payload["selected_candidates"][1]["preview_url"].startswith("data:image/"))
+        self.assertIn("transition_context", payload["selected_candidates"][0]["selection_reasons"])
         self.assertEqual(payload["debug_trace"][0]["frame_type"], "periodic_sample")
 
     def test_workflow_from_video_dynamic_sampling_includes_candidate_summary(self) -> None:
         client = TestClient(main_module.app)
         original_person_mask_service = main_module.person_mask_service
         original_sampler = main_module.sample_dynamic_video_workflow_frames
-        main_module.person_mask_service = FakePersonMaskService([2, 0, 0])
+        main_module.person_mask_service = FakePersonMaskService([0, 0, 0])
         main_module.sample_dynamic_video_workflow_frames = lambda *args, **kwargs: [
             {
                 "image": np.zeros((24, 24, 3), dtype=np.uint8),
@@ -433,7 +435,13 @@ class ActionWorkflowDemoTest(unittest.TestCase):
                 "sampling_state": "occupied",
                 "priority": 0.42,
                 "reason_codes": ["person_present"],
-                "features": {"change_score": 0.0, "person_present": True, "person_count": 2},
+                "features": {
+                    "change_score": 0.0,
+                    "person_present": True,
+                    "person_count": 1,
+                    "raw_person_count": 2,
+                    "person_relevance_reason": "person_near_table",
+                },
             },
             {
                 "image": np.zeros((24, 24, 3), dtype=np.uint8),
@@ -484,6 +492,8 @@ class ActionWorkflowDemoTest(unittest.TestCase):
         self.assertEqual(payload["candidate_summary"][1]["frame_type"], "meal_end_candidate")
         self.assertEqual(payload["debug_trace_count"], 3)
         self.assertEqual(payload["episodes"][0]["post_check_at"], 240.0)
+        self.assertTrue(payload["frames"][0]["person_present"])
+        self.assertEqual(payload["frames"][0]["occupancy_source"], "dynamic_person_relevance")
         self.assertEqual(payload["frames"][1]["payload"]["sampler_frame_type"], "meal_end_candidate")
         self.assertEqual(payload["frames"][2]["payload"]["sampler_reason_codes"], ["post_check_stable"])
 
