@@ -629,11 +629,17 @@ class SimulatorApp(tk.Tk):
         if self.analysis_result is None:
             self.result_summary_label.configure(text="No results available.")
             return
+        metadata = self.analysis_result.metadata if isinstance(self.analysis_result.metadata, dict) else {}
+        sampling_note = ""
+        if metadata.get("sample_mode") == "dynamic_per_table":
+            observed_count = int(metadata.get("observed_frame_count", 0))
+            selected_count = int(metadata.get("sampled_frame_count", 0))
+            sampling_note = f" | dynamic sampler observed {observed_count} frames and reviewed {selected_count} candidates"
         self.result_summary_label.configure(
             text=(
                 self._compact_text(
                     f"Overall score {self.analysis_result.overall_score:.1f} | {self.analysis_result.overall_label} | "
-                    f"{self.analysis_result.overall_summary}",
+                    f"{self.analysis_result.overall_summary}{sampling_note}",
                     260,
                 )
             ),
@@ -671,8 +677,10 @@ class SimulatorApp(tk.Tk):
                         frame.evidence_path,
                         [
                             format_seconds(frame.timestamp_seconds),
+                            self._short_sampler_type(frame.frame_type),
+                            self._short_selection_reason(frame.selection_reasons),
                             f"score {frame.score}",
-                            f"det {frame.detection_count}",
+                            f"det {frame.detection_count} / {frame.person_relevance_reason}",
                         ],
                     )
                     for frame in ordered_frames
@@ -708,8 +716,10 @@ class SimulatorApp(tk.Tk):
                         frame.evidence_path,
                         [
                             format_seconds(frame.timestamp_seconds),
+                            self._short_sampler_type(frame.frame_type),
+                            self._short_selection_reason(frame.selection_reasons),
                             self._short_state(frame.frame_state),
-                            f"final {self._short_state(frame.final_state)}",
+                            f"final {self._short_state(frame.final_state)} / {frame.person_relevance_reason}",
                         ],
                     )
                     for frame in frames
@@ -779,7 +789,15 @@ class SimulatorApp(tk.Tk):
     def _representative_temporal_frames(self, frames: list[Any]) -> list[Any]:
         if len(frames) <= 3:
             return frames
-        indices = sorted({0, len(frames) // 2, len(frames) - 1})
+        interesting_index = next(
+            (
+                index
+                for index, frame in enumerate(frames)
+                if getattr(frame, "frame_type", "periodic_sample") != "periodic_sample"
+            ),
+            len(frames) // 2,
+        )
+        indices = sorted({0, interesting_index, len(frames) - 1})
         return [frames[index] for index in indices]
 
     def _clear_container(self, container: ttk.Frame) -> None:
@@ -795,6 +813,22 @@ class SimulatorApp(tk.Tk):
             "CLEANING": "CLEANING",
             "DINING": "DINING",
         }.get(state, state)
+
+    def _short_sampler_type(self, frame_type: str) -> str:
+        return {
+            "occupied_representative": "occupied",
+            "meal_end_candidate": "meal_end",
+            "cleaning_before_candidate": "pre_clean",
+            "cleaning_candidate": "cleaning",
+            "post_check": "post_check",
+            "periodic_sample": "periodic",
+        }.get(frame_type, frame_type)
+
+    def _short_selection_reason(self, reasons: list[str]) -> str:
+        if not reasons:
+            return "review"
+        label = ",".join(reasons[:2])
+        return self._compact_text(label, 22)
 
     def _compact_text(self, value: str, limit: int) -> str:
         text = self._ascii_text(value)

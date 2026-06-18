@@ -49,6 +49,19 @@ class SampledFrame:
     index: int
     timestamp_seconds: float
     frame_path: Path
+    frame_type: str = "periodic_sample"
+    sampling_state: str = "idle"
+    priority: float = 0.0
+    reason_codes: list[str] = field(default_factory=list)
+    selection_reasons: list[str] = field(default_factory=list)
+    person_present: bool = False
+    person_count: int = 0
+    raw_person_count: int = 0
+    best_relevant_person_score: float = 0.0
+    person_relevance_reason: str = "unknown"
+    episode_id: str | None = None
+    object_crop_box: TableBox | None = None
+    action_crop_box: TableBox | None = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +78,9 @@ class ObjectFrameResult:
     exact_objects: list[str]
     estimated_objects: list[str]
     detection_count: int
+    frame_type: str = "periodic_sample"
+    selection_reasons: list[str] = field(default_factory=list)
+    person_relevance_reason: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -84,6 +100,9 @@ class TemporalFrameResult:
     confidence: float
     reason: str
     temporal_reason: str
+    frame_type: str = "periodic_sample"
+    selection_reasons: list[str] = field(default_factory=list)
+    person_relevance_reason: str = "unknown"
 
 
 @dataclass(frozen=True)
