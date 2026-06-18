@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 
 from simulator import backend
-from simulator.models import TableBox
+from simulator.models import TableBox, TemporalFrameResult
 
 
 class DummyPersonMaskService:
@@ -140,6 +140,96 @@ class SimulatorBackendTest(unittest.TestCase):
         self.assertEqual(sorted(sampled_frames_by_table), ["T01", "T02"])
         self.assertEqual(sampling_metadata_by_table["T01"]["observed_frame_count"], 3)
         self.assertEqual(sampling_metadata_by_table["T02"]["observed_frame_count"], 3)
+
+    def test_temporal_gap_summary_reports_meal_end_to_cleaning_gap(self) -> None:
+        frame_results = [
+            TemporalFrameResult(
+                table_id="T01",
+                timestamp_seconds=120.0,
+                frame_path=Path("frame_120.png"),
+                crop_path=Path("crop_120.png"),
+                evidence_path=Path("evidence_120.png"),
+                visible_people=False,
+                active_dining=False,
+                cleaning_action=False,
+                used_dishes_or_leftovers=True,
+                personal_items_or_food_remaining=False,
+                frame_state="AFTER_MEAL_CANDIDATE",
+                final_state="UNCERTAIN",
+                confidence=0.7,
+                reason="after meal candidate",
+                temporal_reason="candidate",
+                frame_type="meal_end_candidate",
+            ),
+            TemporalFrameResult(
+                table_id="T01",
+                timestamp_seconds=165.0,
+                frame_path=Path("frame_165.png"),
+                crop_path=Path("crop_165.png"),
+                evidence_path=Path("evidence_165.png"),
+                visible_people=True,
+                active_dining=False,
+                cleaning_action=True,
+                used_dishes_or_leftovers=True,
+                personal_items_or_food_remaining=False,
+                frame_state="CLEANING",
+                final_state="CLEANING",
+                confidence=0.9,
+                reason="cleaning",
+                temporal_reason="cleaning detected",
+                frame_type="cleaning_candidate",
+            ),
+        ]
+
+        summary = backend.temporal_gap_summary(frame_results)
+
+        self.assertEqual(summary, "meal end 02:00 -> cleaning 02:45 (gap 00:45)")
+
+    def test_temporal_summary_includes_gap_context_in_headline_and_evidence(self) -> None:
+        table = TableBox("T01", 0, 0, 50, 50)
+        frame_results = [
+            TemporalFrameResult(
+                table_id="T01",
+                timestamp_seconds=120.0,
+                frame_path=Path("frame_120.png"),
+                crop_path=Path("crop_120.png"),
+                evidence_path=Path("evidence_120.png"),
+                visible_people=False,
+                active_dining=False,
+                cleaning_action=False,
+                used_dishes_or_leftovers=True,
+                personal_items_or_food_remaining=False,
+                frame_state="AFTER_MEAL_CANDIDATE",
+                final_state="UNCERTAIN",
+                confidence=0.7,
+                reason="after meal candidate",
+                temporal_reason="candidate",
+                frame_type="meal_end_candidate",
+            ),
+            TemporalFrameResult(
+                table_id="T01",
+                timestamp_seconds=165.0,
+                frame_path=Path("frame_165.png"),
+                crop_path=Path("crop_165.png"),
+                evidence_path=Path("evidence_165.png"),
+                visible_people=True,
+                active_dining=False,
+                cleaning_action=True,
+                used_dishes_or_leftovers=True,
+                personal_items_or_food_remaining=False,
+                frame_state="CLEANING",
+                final_state="CLEANING",
+                confidence=0.9,
+                reason="cleaning",
+                temporal_reason="cleaning detected",
+                frame_type="cleaning_candidate",
+            ),
+        ]
+
+        summary = backend.IntegratedAnalyzer._summarize_temporal_table(object(), table, frame_results)
+
+        self.assertIn("meal end 02:00 -> cleaning 02:45 (gap 00:45).", summary.headline)
+        self.assertEqual(summary.evidence[0], "meal end 02:00 -> cleaning 02:45 (gap 00:45)")
 
 
 if __name__ == "__main__":

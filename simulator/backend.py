@@ -41,6 +41,7 @@ from vlm_classifier.state_tracker import RestaurantStateTracker
 
 DEFAULT_CLEANLINESS_PROMPT_PROFILE = "restaurant"
 DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
+SIMULATOR_AFTER_MEAL_THRESHOLD_SECONDS = 180
 SIMULATOR_REVIEW_FRAME_BUDGET = 8
 SIMULATOR_MIN_OBSERVATION_BUDGET = 24
 SIMULATOR_OBSERVATION_MULTIPLIER = 6
@@ -1180,7 +1181,7 @@ class IntegratedAnalyzer:
 
         def worker(table: TableBox) -> TemporalTableSummary:
             classifier = TemporalFrameClassifier(model=DEFAULT_OPENAI_MODEL)
-            tracker = RestaurantStateTracker(empty_threshold_seconds=600)
+            tracker = RestaurantStateTracker(empty_threshold_seconds=SIMULATOR_AFTER_MEAL_THRESHOLD_SECONDS)
             frame_results: list[TemporalFrameResult] = []
             table_dir = tables_dir / table.table_id / "temporal"
             table_dir.mkdir(parents=True, exist_ok=True)
@@ -1275,19 +1276,25 @@ class IntegratedAnalyzer:
         latest = frame_results[-1]
         average_confidence = sum(item.confidence for item in frame_results) / max(1, len(frame_results))
         aggregate_score = temporal_state_score(latest.final_state)
+        gap_summary = temporal_gap_summary(frame_results)
         evidence = []
+        if gap_summary is not None:
+            evidence.append(gap_summary)
         for item in frame_results[:4]:
             selection = ",".join(item.selection_reasons) if item.selection_reasons else "review"
             evidence.append(
                 f"{format_seconds(item.timestamp_seconds)} {item.frame_type} [{selection}] frame={item.frame_state} final={item.final_state}: {item.temporal_reason}"
             )
+        headline = latest.temporal_reason
+        if gap_summary is not None:
+            headline = f"{headline} {gap_summary}."
         return TemporalTableSummary(
             table=table,
             frame_results=frame_results,
             aggregate_score=aggregate_score,
             aggregate_confidence=average_confidence,
             final_state=latest.final_state,
-            headline=latest.temporal_reason,
+            headline=headline,
             evidence=evidence,
         )
 
@@ -1345,6 +1352,36 @@ def temporal_state_score(state: str) -> float:
         "UNCERTAIN": 3.0,
     }
     return mapping.get(state.upper(), 3.0)
+
+
+def is_meal_end_reference_frame(frame: TemporalFrameResult) -> bool:
+    return frame.frame_type in {"meal_end_candidate", "cleaning_before_candidate"} or frame.frame_state == "AFTER_MEAL_CANDIDATE"
+
+
+def is_cleaning_reference_frame(frame: TemporalFrameResult) -> bool:
+    return frame.cleaning_action or frame.frame_state == "CLEANING" or frame.final_state == "CLEANING"
+
+
+def temporal_gap_summary(frame_results: list[TemporalFrameResult]) -> str | None:
+    first_cleaning = next((frame for frame in frame_results if is_cleaning_reference_frame(frame)), None)
+    if first_cleaning is None:
+        return None
+
+    meal_end_candidates = [
+        frame
+        for frame in frame_results
+        if frame.timestamp_seconds <= first_cleaning.timestamp_seconds and is_meal_end_reference_frame(frame)
+    ]
+    if not meal_end_candidates:
+        return None
+
+    meal_end_frame = meal_end_candidates[-1]
+    gap_seconds = max(0.0, first_cleaning.timestamp_seconds - meal_end_frame.timestamp_seconds)
+    return (
+        f"meal end {format_seconds(meal_end_frame.timestamp_seconds)} -> "
+        f"cleaning {format_seconds(first_cleaning.timestamp_seconds)} "
+        f"(gap {format_seconds(gap_seconds)})"
+    )
 
 
 def cleanliness_label(score: float) -> str:
