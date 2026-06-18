@@ -14,6 +14,12 @@ from typing import Any, Callable
 import cv2
 import numpy as np
 
+from app.person_masking import PersonMaskService
+from app.vision_workflow_preprocessor import (
+    DynamicVideoSamplingConfig,
+    sample_dynamic_video_workflow_frames,
+    summarize_dynamic_video_samples,
+)
 from simulator.models import (
     AnalysisSessionResult,
     CombinedTableResult,
@@ -28,6 +34,9 @@ from vlm_classifier.state_tracker import RestaurantStateTracker
 
 DEFAULT_CLEANLINESS_PROMPT_PROFILE = "restaurant"
 DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
+SIMULATOR_REVIEW_FRAME_BUDGET = 8
+SIMULATOR_MIN_OBSERVATION_BUDGET = 24
+SIMULATOR_OBSERVATION_MULTIPLIER = 6
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 FRAME_CLASSIFICATION_SCHEMA: dict[str, Any] = {
@@ -113,6 +122,158 @@ def crop_box(image: np.ndarray, box: TableBox) -> np.ndarray:
     height, width = image.shape[:2]
     clamped = box.clamp(width, height)
     return image[clamped.y1 : clamped.y2, clamped.x1 : clamped.x2].copy()
+
+
+def probe_video_duration_seconds(video_path: Path) -> float | None:
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+    finally:
+        capture.release()
+    if fps <= 0 or frame_count <= 0:
+        return None
+    return frame_count / fps
+
+
+def simulator_observation_budget(
+    review_budget: int,
+    *,
+    duration_seconds: float | None,
+    base_interval_seconds: float,
+) -> int:
+    baseline_budget = max(review_budget * SIMULATOR_OBSERVATION_MULTIPLIER, SIMULATOR_MIN_OBSERVATION_BUDGET)
+    if duration_seconds is None or duration_seconds <= 0:
+        return baseline_budget
+
+    occupied_interval_seconds = max(1.0, min(base_interval_seconds, 5.0))
+    timeline_budget = int(math.ceil(duration_seconds / occupied_interval_seconds)) + 1
+    return max(baseline_budget, timeline_budget)
+
+
+def simulator_sampling_config(base_interval_seconds: float, observation_budget: int) -> DynamicVideoSamplingConfig:
+    return DynamicVideoSamplingConfig(
+        idle_interval_seconds=max(base_interval_seconds, 1.0),
+        occupied_interval_seconds=max(1.0, min(base_interval_seconds, 5.0)),
+        transition_interval_seconds=max(0.5, min(base_interval_seconds / 2.0, 2.0)),
+        post_check_interval_seconds=max(1.0, min(base_interval_seconds / 2.0, 3.0)),
+        max_observations=max(observation_budget, 1),
+    )
+
+
+def interaction_crop_box(table: TableBox, sample: dict[str, Any], image_shape: tuple[int, ...]) -> TableBox:
+    bounds = ((sample.get("features") or {}).get("interaction_halo_bounds") or {})
+    if not isinstance(bounds, dict):
+        return table
+    try:
+        x = int(bounds["x"])
+        y = int(bounds["y"])
+        width = int(bounds["width"])
+        height = int(bounds["height"])
+    except (KeyError, TypeError, ValueError):
+        return table
+    return TableBox(
+        table.table_id,
+        x,
+        y,
+        x + max(1, width),
+        y + max(1, height),
+    ).clamp(image_shape[1], image_shape[0])
+
+
+def serialize_sampling_trace(sample: dict[str, Any]) -> dict[str, Any]:
+    features = sample.get("features") or {}
+    return {
+        "sample_index": int(sample.get("sample_index", 0)),
+        "offset_seconds": float(sample.get("offset_seconds", 0.0)),
+        "frame_type": str(sample.get("frame_type", "periodic_sample")),
+        "sampling_state": str(sample.get("sampling_state", "idle")),
+        "priority": float(sample.get("priority", 0.0)),
+        "reason_codes": [str(item) for item in sample.get("reason_codes", [])],
+        "selection_reasons": [str(item) for item in sample.get("selection_reasons", [])],
+        "selected_for_review": bool(sample.get("selected_for_review", False)),
+        "episode_id": sample.get("episode_id"),
+        "person_present": bool(features.get("person_present", False)),
+        "person_count": int(features.get("person_count", 0)),
+        "raw_person_count": int(features.get("raw_person_count", 0)),
+        "best_relevant_person_score": float(features.get("best_relevant_person_score", 0.0)),
+        "person_relevance_reason": str(features.get("person_relevance_reason", "unknown")),
+        "change_score": float(features.get("change_score", 0.0)),
+    }
+
+
+def build_dynamic_sampled_frames(
+    *,
+    video_path: Path,
+    table: TableBox,
+    output_dir: Path,
+    base_interval_seconds: float,
+    cancel_event: Event,
+    person_mask_service: PersonMaskService,
+) -> tuple[list[SampledFrame], dict[str, Any]]:
+    if cancel_event.is_set():
+        raise CancelledError("sampling cancelled")
+
+    review_budget = SIMULATOR_REVIEW_FRAME_BUDGET
+    duration_seconds = probe_video_duration_seconds(video_path)
+    observation_budget = simulator_observation_budget(
+        review_budget,
+        duration_seconds=duration_seconds,
+        base_interval_seconds=base_interval_seconds,
+    )
+    raw_samples = sample_dynamic_video_workflow_frames(
+        video_path=video_path,
+        max_frames=review_budget,
+        observation_budget=observation_budget,
+        interaction_roi=table.to_roi(),
+        person_mask_service=person_mask_service,
+        sampling_config=simulator_sampling_config(base_interval_seconds, observation_budget),
+    )
+    summary = summarize_dynamic_video_samples(raw_samples, target_count=review_budget)
+    selected_samples = list(summary["selected_samples"])
+    if not selected_samples:
+        raise ValueError(f"no dynamic review candidates could be prepared for {table.table_id}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    sampled_frames: list[SampledFrame] = []
+    for sample in selected_samples:
+        if cancel_event.is_set():
+            raise CancelledError("sampling cancelled")
+        timestamp_seconds = float(sample.get("offset_seconds", 0.0))
+        sample_index = int(sample.get("sample_index", len(sampled_frames)))
+        frame_path = output_dir / f"frame_{sample_index:03d}_{int(round(timestamp_seconds * 1000)):07d}ms.jpg"
+        image = sample["image"]
+        save_image(frame_path, image)
+        features = sample.get("features") or {}
+        sampled_frames.append(
+            SampledFrame(
+                index=sample_index,
+                timestamp_seconds=timestamp_seconds,
+                frame_path=frame_path,
+                frame_type=str(sample.get("frame_type", "periodic_sample")),
+                sampling_state=str(sample.get("sampling_state", "idle")),
+                priority=float(sample.get("priority", 0.0)),
+                reason_codes=[str(item) for item in sample.get("reason_codes", [])],
+                selection_reasons=[str(item) for item in sample.get("selection_reasons", [])],
+                person_present=bool(features.get("person_present", False)),
+                person_count=int(features.get("person_count", 0)),
+                raw_person_count=int(features.get("raw_person_count", 0)),
+                best_relevant_person_score=float(features.get("best_relevant_person_score", 0.0)),
+                person_relevance_reason=str(features.get("person_relevance_reason", "unknown")),
+                episode_id=str(sample.get("episode_id")) if sample.get("episode_id") is not None else None,
+                object_crop_box=table,
+                action_crop_box=interaction_crop_box(table, sample, image.shape),
+            )
+        )
+
+    return sampled_frames, {
+        "duration_seconds": duration_seconds,
+        "observed_frame_count": len(summary["debug_trace"]),
+        "selected_frame_count": len(sampled_frames),
+        "review_frame_budget": review_budget,
+        "observation_budget": observation_budget,
+        "debug_trace": [serialize_sampling_trace(sample) for sample in summary["debug_trace"]],
+    }
 
 
 def draw_label(image: np.ndarray, text: str, origin: tuple[int, int], color: tuple[int, int, int]) -> None:
@@ -330,7 +491,7 @@ class TemporalFrameClassifier:
 
     def classify(self, crop_path: Path) -> dict[str, Any]:
         prompt = (
-            "You are analyzing one low-resolution CCTV crop of a restaurant table.\n"
+            "You are analyzing one low-resolution CCTV crop centered on a restaurant table and its immediate interaction area.\n"
             "Your goal is not overall cleanliness yet. First infer the operational table state from the frame.\n"
             "Be conservative: a single frame should not overclaim that the meal is fully finished.\n"
             "Assess the following booleans and one frame_state label.\n"
@@ -456,6 +617,7 @@ class PipelineProgress:
 class IntegratedAnalyzer:
     def __init__(self) -> None:
         self.table_detector = TableDetector()
+        self.person_mask_service = PersonMaskService()
 
     def auto_detect_tables(self, frame_path: Path) -> list[TableBox]:
         return self.table_detector.detect(frame_path)
@@ -481,20 +643,53 @@ class IntegratedAnalyzer:
         frames_dir.mkdir(parents=True, exist_ok=True)
         tables_dir.mkdir(parents=True, exist_ok=True)
 
-        progress_callback({"type": "log", "message": f"Sampling frames from {video_path.name} every {frame_interval_seconds:.1f}s"})
-        sampled_frames = sample_video_frames(
-            video_path,
-            interval_seconds=frame_interval_seconds,
-            output_dir=frames_dir,
-            max_frames=18,
-            cancel_event=cancel_event,
-        )
         progress_callback(
             {
                 "type": "log",
-                "message": f"Prepared {len(sampled_frames)} sampled frames for {len(tables)} tables.",
+                "message": f"Building dynamic table candidates from {video_path.name} with base interval {frame_interval_seconds:.1f}s.",
             }
         )
+        sampled_frames_by_table: dict[str, list[SampledFrame]] = {}
+        sampling_metadata_by_table: dict[str, dict[str, Any]] = {}
+        sampled_frames: list[SampledFrame] = []
+        for table in tables:
+            if cancel_event.is_set():
+                raise CancelledError("sampling cancelled")
+            progress_callback({"type": "log", "message": f"[Sampler] {table.table_id} observing candidate moments..."})
+            table_output_dir = frames_dir / table.table_id
+            table_samples, table_sampling_metadata = build_dynamic_sampled_frames(
+                video_path=video_path,
+                table=table,
+                output_dir=table_output_dir,
+                base_interval_seconds=frame_interval_seconds,
+                cancel_event=cancel_event,
+                person_mask_service=self.person_mask_service,
+            )
+            sampled_frames_by_table[table.table_id] = table_samples
+            sampling_metadata_by_table[table.table_id] = table_sampling_metadata
+            sampled_frames.extend(table_samples)
+            progress_callback(
+                {
+                    "type": "log",
+                    "message": (
+                        f"[Sampler] {table.table_id} observed {table_sampling_metadata['observed_frame_count']} frames, "
+                        f"selected {table_sampling_metadata['selected_frame_count']} review candidates."
+                    ),
+                }
+            )
+            for sampled in table_samples:
+                selection = ",".join(sampled.selection_reasons) if sampled.selection_reasons else "fallback"
+                progress_callback(
+                    {
+                        "type": "log",
+                        "message": (
+                            f"[Sampler] {table.table_id} @ {format_seconds(sampled.timestamp_seconds)} "
+                            f"{sampled.frame_type} review={selection} "
+                            f"person={sampled.person_count} raw={sampled.raw_person_count} "
+                            f"relevance={sampled.person_relevance_reason}"
+                        ),
+                    }
+                )
 
         object_results: dict[str, ObjectTableSummary] = {}
         temporal_results: dict[str, TemporalTableSummary] = {}
@@ -510,7 +705,7 @@ class IntegratedAnalyzer:
             object_future = object_thread.submit(
                 self._run_object_pipeline,
                 tables,
-                sampled_frames,
+                sampled_frames_by_table,
                 tables_dir,
                 cancel_event,
                 object_results,
@@ -521,7 +716,7 @@ class IntegratedAnalyzer:
             temporal_future = temporal_thread.submit(
                 self._run_temporal_pipeline,
                 tables,
-                sampled_frames,
+                sampled_frames_by_table,
                 tables_dir,
                 cancel_event,
                 temporal_results,
@@ -541,8 +736,12 @@ class IntegratedAnalyzer:
         combined = self._combine_results(video_path, frame_interval_seconds, sampled_frames, tables, object_results, temporal_results, session_dir)
         metadata = {
             "sampled_frame_count": len(sampled_frames),
+            "observed_frame_count": sum(item["observed_frame_count"] for item in sampling_metadata_by_table.values()),
+            "sample_mode": "dynamic_per_table",
+            "review_frame_budget_per_table": SIMULATOR_REVIEW_FRAME_BUDGET,
             "table_count": len(tables),
             "session_dir": str(session_dir),
+            "table_sampling": sampling_metadata_by_table,
         }
         return AnalysisSessionResult(
             video_path=video_path,
@@ -559,7 +758,7 @@ class IntegratedAnalyzer:
     def _run_object_pipeline(
         self,
         tables: list[TableBox],
-        sampled_frames: list[SampledFrame],
+        sampled_frames_by_table: dict[str, list[SampledFrame]],
         tables_dir: Path,
         cancel_event: Event,
         sink: dict[str, ObjectTableSummary],
@@ -567,7 +766,7 @@ class IntegratedAnalyzer:
         emit_progress: Callable[[str, dict[str, Any]], None],
         progress_callback: Callable[[dict[str, Any]], None],
     ) -> None:
-        total = len(tables) * len(sampled_frames)
+        total = sum(len(sampled_frames_by_table.get(table.table_id, [])) for table in tables)
         progress = PipelineProgress(total=total, started_at=time.time())
         completed = 0
 
@@ -588,13 +787,16 @@ class IntegratedAnalyzer:
             frame_results: list[ObjectFrameResult] = []
             table_dir = tables_dir / table.table_id / "object"
             table_dir.mkdir(parents=True, exist_ok=True)
+            table_samples = sampled_frames_by_table.get(table.table_id, [])
+            if not table_samples:
+                raise ValueError(f"no sampled frames prepared for {table.table_id}")
             nonlocal completed
-            for sampled in sampled_frames:
+            for sampled in table_samples:
                 if cancel_event.is_set():
                     raise CancelledError("object pipeline cancelled")
                 frame_image = read_image_file(sampled.frame_path)
                 crop_path = table_dir / f"crop_{sampled.index:03d}.png"
-                crop_image = crop_box(frame_image, table)
+                crop_image = crop_box(frame_image, sampled.object_crop_box or table)
                 save_image(crop_path, crop_image)
                 result = service.inspect_image(
                     crop_path,
@@ -629,6 +831,9 @@ class IntegratedAnalyzer:
                         exact_objects=result.exact_objects,
                         estimated_objects=result.estimated_objects,
                         detection_count=detection_count,
+                        frame_type=sampled.frame_type,
+                        selection_reasons=list(sampled.selection_reasons),
+                        person_relevance_reason=sampled.person_relevance_reason,
                     )
                 )
                 with sink_lock:
@@ -656,7 +861,7 @@ class IntegratedAnalyzer:
     def _run_temporal_pipeline(
         self,
         tables: list[TableBox],
-        sampled_frames: list[SampledFrame],
+        sampled_frames_by_table: dict[str, list[SampledFrame]],
         tables_dir: Path,
         cancel_event: Event,
         sink: dict[str, TemporalTableSummary],
@@ -664,7 +869,7 @@ class IntegratedAnalyzer:
         emit_progress: Callable[[str, dict[str, Any]], None],
         progress_callback: Callable[[dict[str, Any]], None],
     ) -> None:
-        total = len(tables) * len(sampled_frames)
+        total = sum(len(sampled_frames_by_table.get(table.table_id, [])) for table in tables)
         progress = PipelineProgress(total=total, started_at=time.time())
         completed = 0
 
@@ -674,13 +879,16 @@ class IntegratedAnalyzer:
             frame_results: list[TemporalFrameResult] = []
             table_dir = tables_dir / table.table_id / "temporal"
             table_dir.mkdir(parents=True, exist_ok=True)
+            table_samples = sampled_frames_by_table.get(table.table_id, [])
+            if not table_samples:
+                raise ValueError(f"no sampled frames prepared for {table.table_id}")
             nonlocal completed
-            for sampled in sampled_frames:
+            for sampled in table_samples:
                 if cancel_event.is_set():
                     raise CancelledError("temporal pipeline cancelled")
                 frame_image = read_image_file(sampled.frame_path)
                 crop_path = table_dir / f"crop_{sampled.index:03d}.png"
-                crop_image = crop_box(frame_image, table)
+                crop_image = crop_box(frame_image, sampled.action_crop_box or sampled.object_crop_box or table)
                 save_image(crop_path, crop_image)
                 payload = classifier.classify(crop_path)
                 tracker_result = tracker.update(int(round(sampled.timestamp_seconds)), payload)
@@ -711,6 +919,9 @@ class IntegratedAnalyzer:
                         confidence=float(payload["confidence"]),
                         reason=str(payload["reason"]),
                         temporal_reason=temporal_reason,
+                        frame_type=sampled.frame_type,
+                        selection_reasons=list(sampled.selection_reasons),
+                        person_relevance_reason=sampled.person_relevance_reason,
                     )
                 )
                 with sink_lock:
@@ -742,8 +953,9 @@ class IntegratedAnalyzer:
         aggregate_score = float(min(item.score for item in frame_results))
         evidence = []
         for item in ordered[:3]:
+            selection = ",".join(item.selection_reasons) if item.selection_reasons else "review"
             evidence.append(
-                f"{format_seconds(item.timestamp_seconds)} score={item.score} det={item.detection_count}: {item.summary}"
+                f"{format_seconds(item.timestamp_seconds)} {item.frame_type} [{selection}] score={item.score} det={item.detection_count}: {item.summary}"
             )
         return ObjectTableSummary(
             table=table,
@@ -760,8 +972,9 @@ class IntegratedAnalyzer:
         aggregate_score = temporal_state_score(latest.final_state)
         evidence = []
         for item in frame_results[:4]:
+            selection = ",".join(item.selection_reasons) if item.selection_reasons else "review"
             evidence.append(
-                f"{format_seconds(item.timestamp_seconds)} frame={item.frame_state} final={item.final_state}: {item.temporal_reason}"
+                f"{format_seconds(item.timestamp_seconds)} {item.frame_type} [{selection}] frame={item.frame_state} final={item.final_state}: {item.temporal_reason}"
             )
         return TemporalTableSummary(
             table=table,
