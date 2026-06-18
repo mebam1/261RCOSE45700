@@ -14,10 +14,17 @@ from typing import Any, Callable
 import cv2
 import numpy as np
 
-from app.person_masking import PersonMaskService
+from app.person_masking import PersonDetection, PersonMaskService
+from app.vision_workflow_preprocessor import ImageRect
 from app.vision_workflow_preprocessor import (
     DynamicVideoSamplingConfig,
-    sample_dynamic_video_workflow_frames,
+    classify_dynamic_frame,
+    compute_frame_change_score,
+    dynamic_frame_state_priority,
+    expanded_interaction_rect,
+    interval_for_sampling_state,
+    person_relevance_score,
+    roi_to_rect,
     summarize_dynamic_video_samples,
 )
 from simulator.models import (
@@ -181,6 +188,61 @@ def interaction_crop_box(table: TableBox, sample: dict[str, Any], image_shape: t
     ).clamp(image_shape[1], image_shape[0])
 
 
+def estimate_relevant_person_signal_from_scene_detections(
+    *,
+    frame_image: np.ndarray,
+    table: TableBox,
+    detections: list[PersonDetection],
+    sampling_config: DynamicVideoSamplingConfig,
+    temporal_coupling_score: float = 0.0,
+) -> dict[str, Any]:
+    table_rect = roi_to_rect(table.to_roi())
+    interaction_rect = expanded_interaction_rect(
+        table_rect,
+        frame_image.shape,
+        expand_x=sampling_config.interaction_halo_expand_x,
+        expand_y=sampling_config.interaction_halo_expand_y,
+    )
+    scored_detections = [
+        person_relevance_score(
+            ImageRect(x=detection.x, y=detection.y, width=detection.width, height=detection.height),
+            detection_score=detection.score,
+            table_rect=table_rect,
+            interaction_rect=interaction_rect,
+            image_shape=frame_image.shape,
+            temporal_coupling_score=temporal_coupling_score,
+        )
+        for detection in detections
+    ]
+    relevance_scores = [item["score"] for item in scored_detections]
+    best_score = max(relevance_scores, default=0.0)
+    relevant_count = sum(1 for score in relevance_scores if score >= sampling_config.person_relevant_threshold)
+
+    if relevant_count:
+        reason = "person_near_table"
+    elif best_score >= sampling_config.person_uncertain_threshold:
+        reason = "person_uncertain"
+    elif detections:
+        reason = "background_person_likely"
+    else:
+        reason = "no_person"
+
+    return {
+        "raw_person_count": len(detections),
+        "relevant_person_count": relevant_count,
+        "person_present": relevant_count > 0,
+        "best_relevant_person_score": round(best_score, 3),
+        "person_relevance_scores": relevance_scores,
+        "person_relevance_reason": reason,
+        "interaction_halo_bounds": {
+            "x": interaction_rect.x,
+            "y": interaction_rect.y,
+            "width": interaction_rect.width,
+            "height": interaction_rect.height,
+        },
+    }
+
+
 def serialize_sampling_trace(sample: dict[str, Any]) -> dict[str, Any]:
     features = sample.get("features") or {}
     return {
@@ -202,34 +264,120 @@ def serialize_sampling_trace(sample: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_dynamic_sampled_frames(
+def sample_offset_key(offset_seconds: float) -> int:
+    return int(round(float(offset_seconds) * 1000.0))
+
+
+def read_video_frame_at(
+    capture: cv2.VideoCapture,
     *,
-    video_path: Path,
+    offset_seconds: float,
+    fps: float | None,
+) -> dict[str, Any] | None:
+    capture.set(cv2.CAP_PROP_POS_MSEC, float(offset_seconds) * 1000.0)
+    success, frame = capture.read()
+    if not success or frame is None:
+        return None
+    frame_index = None
+    if fps is not None and fps > 0:
+        frame_index = int(round(float(offset_seconds) * fps))
+    return {
+        "image": frame,
+        "offset_seconds": float(offset_seconds),
+        "fps": fps,
+        "frame_index": frame_index,
+    }
+
+
+@dataclass
+class SharedSamplerTableState:
+    table: TableBox
+    next_offset_seconds: float = 0.0
+    previous_crop: np.ndarray | None = None
+    previous_person_present: bool = False
+    previous_state: str = "idle"
+    observation_count: int = 0
+    samples: list[dict[str, Any]] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.samples is None:
+            self.samples = []
+
+
+def build_dynamic_observation_sample(
+    *,
+    table: TableBox,
+    frame_image: np.ndarray,
+    scene_person_detections: list[PersonDetection],
+    offset_seconds: float,
+    sample_index: int,
+    previous_crop: np.ndarray | None,
+    previous_person_present: bool,
+    previous_state: str,
+    sampling_config: DynamicVideoSamplingConfig,
+) -> tuple[dict[str, Any], np.ndarray, bool, str]:
+    crop_image = crop_box(frame_image, table)
+    change_score = compute_frame_change_score(previous_crop, crop_image)
+    person_signal = estimate_relevant_person_signal_from_scene_detections(
+        frame_image=frame_image,
+        table=table,
+        detections=scene_person_detections,
+        sampling_config=sampling_config,
+        temporal_coupling_score=1.0 if change_score >= sampling_config.person_change_coupling_threshold else 0.0,
+    )
+    person_present = bool(person_signal["person_present"])
+    frame_type, sampling_state, reason_codes = classify_dynamic_frame(
+        previous_state=previous_state,
+        previous_person_present=previous_person_present,
+        person_present=person_present,
+        change_score=change_score,
+        sampling_config=sampling_config,
+    )
+    normalized_change = max(0.0, min(change_score, 1.0))
+    priority = max(
+        0.0,
+        min(
+            1.0,
+            dynamic_frame_state_priority(frame_type)
+            + normalized_change * 0.35
+            + (0.15 if previous_person_present != person_present else 0.0),
+        ),
+    )
+    sample = {
+        "sample_index": sample_index,
+        "offset_seconds": float(offset_seconds),
+        "frame_type": frame_type,
+        "sampling_state": sampling_state,
+        "reason_codes": reason_codes,
+        "priority": round(priority, 3),
+        "frame_offset_key": sample_offset_key(offset_seconds),
+        "features": {
+            "change_score": round(change_score, 4),
+            "person_present": person_present,
+            "person_count": int(person_signal["relevant_person_count"]),
+            "raw_person_present": int(person_signal["raw_person_count"]) > 0,
+            "raw_person_count": int(person_signal["raw_person_count"]),
+            "relevant_person_count": int(person_signal["relevant_person_count"]),
+            "best_relevant_person_score": person_signal["best_relevant_person_score"],
+            "person_relevance_scores": person_signal["person_relevance_scores"],
+            "person_relevance_reason": person_signal["person_relevance_reason"],
+            "interaction_halo_bounds": person_signal.get("interaction_halo_bounds"),
+        },
+    }
+    return sample, crop_image, person_present, sampling_state
+
+
+def finalize_dynamic_samples(
+    *,
     table: TableBox,
     output_dir: Path,
-    base_interval_seconds: float,
-    cancel_event: Event,
-    person_mask_service: PersonMaskService,
+    review_budget: int,
+    samples: list[dict[str, Any]],
+    frame_bank: dict[int, np.ndarray],
+    duration_seconds: float | None,
+    observation_budget: int,
 ) -> tuple[list[SampledFrame], dict[str, Any]]:
-    if cancel_event.is_set():
-        raise CancelledError("sampling cancelled")
-
-    review_budget = SIMULATOR_REVIEW_FRAME_BUDGET
-    duration_seconds = probe_video_duration_seconds(video_path)
-    observation_budget = simulator_observation_budget(
-        review_budget,
-        duration_seconds=duration_seconds,
-        base_interval_seconds=base_interval_seconds,
-    )
-    raw_samples = sample_dynamic_video_workflow_frames(
-        video_path=video_path,
-        max_frames=review_budget,
-        observation_budget=observation_budget,
-        interaction_roi=table.to_roi(),
-        person_mask_service=person_mask_service,
-        sampling_config=simulator_sampling_config(base_interval_seconds, observation_budget),
-    )
-    summary = summarize_dynamic_video_samples(raw_samples, target_count=review_budget)
+    summary = summarize_dynamic_video_samples(samples, target_count=review_budget)
     selected_samples = list(summary["selected_samples"])
     if not selected_samples:
         raise ValueError(f"no dynamic review candidates could be prepared for {table.table_id}")
@@ -237,13 +385,14 @@ def build_dynamic_sampled_frames(
     output_dir.mkdir(parents=True, exist_ok=True)
     sampled_frames: list[SampledFrame] = []
     for sample in selected_samples:
-        if cancel_event.is_set():
-            raise CancelledError("sampling cancelled")
         timestamp_seconds = float(sample.get("offset_seconds", 0.0))
         sample_index = int(sample.get("sample_index", len(sampled_frames)))
+        frame_key = int(sample.get("frame_offset_key", sample_offset_key(timestamp_seconds)))
+        frame_image = frame_bank.get(frame_key)
+        if frame_image is None:
+            raise ValueError(f"missing decoded frame for {table.table_id} at {timestamp_seconds:.3f}s")
         frame_path = output_dir / f"frame_{sample_index:03d}_{int(round(timestamp_seconds * 1000)):07d}ms.jpg"
-        image = sample["image"]
-        save_image(frame_path, image)
+        save_image(frame_path, frame_image)
         features = sample.get("features") or {}
         sampled_frames.append(
             SampledFrame(
@@ -262,7 +411,7 @@ def build_dynamic_sampled_frames(
                 person_relevance_reason=str(features.get("person_relevance_reason", "unknown")),
                 episode_id=str(sample.get("episode_id")) if sample.get("episode_id") is not None else None,
                 object_crop_box=table,
-                action_crop_box=interaction_crop_box(table, sample, image.shape),
+                action_crop_box=interaction_crop_box(table, sample, frame_image.shape),
             )
         )
 
@@ -274,6 +423,161 @@ def build_dynamic_sampled_frames(
         "observation_budget": observation_budget,
         "debug_trace": [serialize_sampling_trace(sample) for sample in summary["debug_trace"]],
     }
+
+
+def build_shared_dynamic_sampled_frames_from_reader(
+    *,
+    tables: list[TableBox],
+    output_dir: Path,
+    base_interval_seconds: float,
+    cancel_event: Event,
+    person_mask_service: PersonMaskService,
+    duration_seconds: float | None,
+    frame_reader: Callable[[float], dict[str, Any] | None],
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> tuple[dict[str, list[SampledFrame]], dict[str, dict[str, Any]], int]:
+    review_budget = SIMULATOR_REVIEW_FRAME_BUDGET
+    observation_budget = simulator_observation_budget(
+        review_budget,
+        duration_seconds=duration_seconds,
+        base_interval_seconds=base_interval_seconds,
+    )
+    sampling_config = simulator_sampling_config(base_interval_seconds, observation_budget)
+    states = {
+        table.table_id: SharedSamplerTableState(table=table)
+        for table in tables
+    }
+    frame_bank: dict[int, np.ndarray] = {}
+    decoded_frame_count = 0
+
+    while True:
+        if cancel_event.is_set():
+            raise CancelledError("sampling cancelled")
+
+        due_states = [
+            state
+            for state in states.values()
+            if state.observation_count < sampling_config.max_observations
+            and (duration_seconds is None or state.next_offset_seconds <= duration_seconds + 1e-6)
+        ]
+        if not due_states:
+            break
+
+        current_offset = min(state.next_offset_seconds for state in due_states)
+        ready_states = [
+            state
+            for state in due_states
+            if abs(state.next_offset_seconds - current_offset) <= 1e-6
+        ]
+        frame_payload = frame_reader(current_offset)
+        if frame_payload is None:
+            break
+        decoded_frame_count += 1
+        frame_image = frame_payload["image"]
+        frame_bank[sample_offset_key(current_offset)] = frame_image.copy()
+        _, _, scene_person_detections = person_mask_service.apply_black_mask(frame_image)
+        if progress_callback is not None and (decoded_frame_count == 1 or decoded_frame_count % 10 == 0):
+            progress_callback(
+                {
+                    "type": "log",
+                    "message": (
+                        f"[Sampler] decoded {decoded_frame_count} timestamps "
+                        f"(current {format_seconds(current_offset)}) with {len(scene_person_detections)} scene people."
+                    ),
+                }
+            )
+
+        for state in ready_states:
+            sample, crop_image, person_present, sampling_state = build_dynamic_observation_sample(
+                table=state.table,
+                frame_image=frame_image,
+                scene_person_detections=scene_person_detections,
+                offset_seconds=current_offset,
+                sample_index=state.observation_count,
+                previous_crop=state.previous_crop,
+                previous_person_present=state.previous_person_present,
+                previous_state=state.previous_state,
+                sampling_config=sampling_config,
+            )
+            state.samples.append(sample)
+            state.previous_crop = crop_image
+            state.previous_person_present = person_present
+            state.previous_state = sampling_state
+            state.next_offset_seconds = current_offset + interval_for_sampling_state(sampling_state, sampling_config)
+            state.observation_count += 1
+
+    sampled_frames_by_table: dict[str, list[SampledFrame]] = {}
+    sampling_metadata_by_table: dict[str, dict[str, Any]] = {}
+    for table in tables:
+        table_output_dir = output_dir / table.table_id
+        sampled_frames, metadata = finalize_dynamic_samples(
+            table=table,
+            output_dir=table_output_dir,
+            review_budget=review_budget,
+            samples=states[table.table_id].samples,
+            frame_bank=frame_bank,
+            duration_seconds=duration_seconds,
+            observation_budget=observation_budget,
+        )
+        sampled_frames_by_table[table.table_id] = sampled_frames
+        sampling_metadata_by_table[table.table_id] = metadata
+
+    return sampled_frames_by_table, sampling_metadata_by_table, decoded_frame_count
+
+
+def build_shared_dynamic_sampled_frames(
+    *,
+    video_path: Path,
+    tables: list[TableBox],
+    output_dir: Path,
+    base_interval_seconds: float,
+    cancel_event: Event,
+    person_mask_service: PersonMaskService,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> tuple[dict[str, list[SampledFrame]], dict[str, dict[str, Any]], int]:
+    duration_seconds = probe_video_duration_seconds(video_path)
+    capture = cv2.VideoCapture(str(video_path))
+    fps_value = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+    fps = fps_value if fps_value > 0 else None
+
+    def frame_reader(offset_seconds: float) -> dict[str, Any] | None:
+        return read_video_frame_at(capture, offset_seconds=offset_seconds, fps=fps)
+
+    try:
+        return build_shared_dynamic_sampled_frames_from_reader(
+            tables=tables,
+            output_dir=output_dir,
+            base_interval_seconds=base_interval_seconds,
+            cancel_event=cancel_event,
+            person_mask_service=person_mask_service,
+            duration_seconds=duration_seconds,
+            frame_reader=frame_reader,
+            progress_callback=progress_callback,
+        )
+    finally:
+        capture.release()
+
+
+def build_dynamic_sampled_frames(
+    *,
+    video_path: Path,
+    table: TableBox,
+    output_dir: Path,
+    base_interval_seconds: float,
+    cancel_event: Event,
+    person_mask_service: PersonMaskService,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> tuple[list[SampledFrame], dict[str, Any]]:
+    sampled_frames_by_table, sampling_metadata_by_table, _ = build_shared_dynamic_sampled_frames(
+        video_path=video_path,
+        tables=[table],
+        output_dir=output_dir,
+        base_interval_seconds=base_interval_seconds,
+        cancel_event=cancel_event,
+        person_mask_service=person_mask_service,
+        progress_callback=progress_callback,
+    )
+    return sampled_frames_by_table[table.table_id], sampling_metadata_by_table[table.table_id]
 
 
 def draw_label(image: np.ndarray, text: str, origin: tuple[int, int], color: tuple[int, int, int]) -> None:
@@ -646,28 +950,28 @@ class IntegratedAnalyzer:
         progress_callback(
             {
                 "type": "log",
-                "message": f"Building dynamic table candidates from {video_path.name} with base interval {frame_interval_seconds:.1f}s.",
+                "message": f"Building shared-decode table candidates from {video_path.name} with base interval {frame_interval_seconds:.1f}s.",
             }
         )
-        sampled_frames_by_table: dict[str, list[SampledFrame]] = {}
-        sampling_metadata_by_table: dict[str, dict[str, Any]] = {}
-        sampled_frames: list[SampledFrame] = []
+        sampled_frames_by_table, sampling_metadata_by_table, decoded_frame_count = build_shared_dynamic_sampled_frames(
+            video_path=video_path,
+            tables=tables,
+            output_dir=frames_dir,
+            base_interval_seconds=frame_interval_seconds,
+            cancel_event=cancel_event,
+            person_mask_service=self.person_mask_service,
+            progress_callback=progress_callback,
+        )
+        sampled_frames = [frame for table in tables for frame in sampled_frames_by_table.get(table.table_id, [])]
+        progress_callback(
+            {
+                "type": "log",
+                "message": f"[Sampler] Shared decode visited {decoded_frame_count} unique timestamps across {len(tables)} tables.",
+            }
+        )
         for table in tables:
-            if cancel_event.is_set():
-                raise CancelledError("sampling cancelled")
-            progress_callback({"type": "log", "message": f"[Sampler] {table.table_id} observing candidate moments..."})
-            table_output_dir = frames_dir / table.table_id
-            table_samples, table_sampling_metadata = build_dynamic_sampled_frames(
-                video_path=video_path,
-                table=table,
-                output_dir=table_output_dir,
-                base_interval_seconds=frame_interval_seconds,
-                cancel_event=cancel_event,
-                person_mask_service=self.person_mask_service,
-            )
-            sampled_frames_by_table[table.table_id] = table_samples
-            sampling_metadata_by_table[table.table_id] = table_sampling_metadata
-            sampled_frames.extend(table_samples)
+            table_sampling_metadata = sampling_metadata_by_table[table.table_id]
+            table_samples = sampled_frames_by_table[table.table_id]
             progress_callback(
                 {
                     "type": "log",
@@ -737,7 +1041,8 @@ class IntegratedAnalyzer:
         metadata = {
             "sampled_frame_count": len(sampled_frames),
             "observed_frame_count": sum(item["observed_frame_count"] for item in sampling_metadata_by_table.values()),
-            "sample_mode": "dynamic_per_table",
+            "decoded_frame_count": decoded_frame_count,
+            "sample_mode": "dynamic_shared_decode",
             "review_frame_budget_per_table": SIMULATOR_REVIEW_FRAME_BUDGET,
             "table_count": len(tables),
             "session_dir": str(session_dir),

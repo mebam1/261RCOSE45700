@@ -11,7 +11,12 @@ from simulator.models import TableBox
 
 
 class DummyPersonMaskService:
-    pass
+    def __init__(self) -> None:
+        self.call_count = 0
+
+    def apply_black_mask(self, image):
+        self.call_count += 1
+        return image, np.zeros(image.shape[:2], dtype=np.uint8), []
 
 
 class SimulatorBackendTest(unittest.TestCase):
@@ -27,39 +32,44 @@ class SimulatorBackendTest(unittest.TestCase):
     def test_build_dynamic_sampled_frames_preserves_sampler_metadata_and_split_crops(self) -> None:
         table = TableBox("T01", 20, 30, 80, 90)
         image = np.zeros((180, 240, 3), dtype=np.uint8)
-        sample = {
-            "sample_index": 3,
-            "offset_seconds": 12.0,
-            "image": image,
-            "frame_type": "cleaning_candidate",
-            "sampling_state": "cleaning_candidate",
-            "priority": 0.91,
-            "reason_codes": ["person_reentered", "high_table_change"],
-            "selection_reasons": ["post_exit_change"],
-            "episode_id": "episode_01",
-            "features": {
-                "person_present": True,
-                "person_count": 1,
-                "raw_person_count": 2,
-                "best_relevant_person_score": 0.87,
-                "person_relevance_reason": "person_near_table",
-                "interaction_halo_bounds": {"x": 5, "y": 10, "width": 140, "height": 120},
-                "change_score": 0.22,
-            },
-        }
-
-        original_sampler = backend.sample_dynamic_video_workflow_frames
-        original_summary = backend.summarize_dynamic_video_samples
-        original_probe_duration = backend.probe_video_duration_seconds
-        backend.sample_dynamic_video_workflow_frames = lambda **kwargs: [sample]
-        backend.summarize_dynamic_video_samples = lambda samples, target_count: {
-            "selected_samples": [dict(sample)],
-            "debug_trace": [dict(sample, selected_for_review=True)],
-        }
-        backend.probe_video_duration_seconds = lambda video_path: 1200.0
+        original_builder = backend.build_shared_dynamic_sampled_frames
 
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
+                frame_path = backend.save_image(Path(tmpdir) / "frame.png", image)
+                backend.build_shared_dynamic_sampled_frames = lambda **kwargs: (
+                    {
+                        table.table_id: [
+                            backend.SampledFrame(
+                                index=3,
+                                timestamp_seconds=12.0,
+                                frame_path=frame_path,
+                                frame_type="cleaning_candidate",
+                                sampling_state="cleaning_candidate",
+                                priority=0.91,
+                                reason_codes=["person_reentered", "high_table_change"],
+                                selection_reasons=["post_exit_change"],
+                                person_present=True,
+                                person_count=1,
+                                raw_person_count=2,
+                                best_relevant_person_score=0.87,
+                                person_relevance_reason="person_near_table",
+                                episode_id="episode_01",
+                                object_crop_box=table,
+                                action_crop_box=TableBox("T01", 5, 10, 145, 130),
+                            )
+                        ]
+                    },
+                    {
+                        table.table_id: {
+                            "duration_seconds": 1200.0,
+                            "observed_frame_count": 1,
+                            "selected_frame_count": 1,
+                            "debug_trace": [{"frame_type": "cleaning_candidate", "selected_for_review": True}],
+                        }
+                    },
+                    1,
+                )
                 sampled_frames, metadata = backend.build_dynamic_sampled_frames(
                     video_path=Path("demo.mp4"),
                     table=table,
@@ -72,9 +82,7 @@ class SimulatorBackendTest(unittest.TestCase):
                 sampled = sampled_frames[0]
                 self.assertTrue(sampled.frame_path.exists())
         finally:
-            backend.sample_dynamic_video_workflow_frames = original_sampler
-            backend.summarize_dynamic_video_samples = original_summary
-            backend.probe_video_duration_seconds = original_probe_duration
+            backend.build_shared_dynamic_sampled_frames = original_builder
 
         sampled = sampled_frames[0]
         self.assertEqual(sampled.object_crop_box, table)
@@ -91,6 +99,47 @@ class SimulatorBackendTest(unittest.TestCase):
         table = TableBox("T02", 10, 15, 40, 55)
         resolved = backend.interaction_crop_box(table, {"features": {}}, (100, 120, 3))
         self.assertEqual(resolved, table)
+
+    def test_shared_dynamic_sampler_decodes_common_timestamps_once_for_multiple_tables(self) -> None:
+        tables = [
+            TableBox("T01", 10, 10, 50, 50),
+            TableBox("T02", 60, 10, 100, 50),
+        ]
+        call_offsets: list[float] = []
+        person_mask_service = DummyPersonMaskService()
+        frames_by_offset = {
+            0.0: np.zeros((120, 160, 3), dtype=np.uint8),
+            10.0: np.zeros((120, 160, 3), dtype=np.uint8),
+            20.0: np.zeros((120, 160, 3), dtype=np.uint8),
+        }
+
+        def frame_reader(offset_seconds: float):
+            rounded = round(offset_seconds, 1)
+            call_offsets.append(rounded)
+            image = frames_by_offset.get(rounded)
+            if image is None:
+                return None
+            return {"image": image.copy(), "offset_seconds": rounded, "fps": 1.0, "frame_index": int(round(rounded))}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sampled_frames_by_table, sampling_metadata_by_table, decoded_frame_count = (
+                backend.build_shared_dynamic_sampled_frames_from_reader(
+                    tables=tables,
+                    output_dir=Path(tmpdir),
+                    base_interval_seconds=10.0,
+                    cancel_event=backend.Event(),
+                    person_mask_service=person_mask_service,
+                    duration_seconds=20.0,
+                    frame_reader=frame_reader,
+                )
+            )
+
+        self.assertEqual(decoded_frame_count, 3)
+        self.assertEqual(person_mask_service.call_count, 3)
+        self.assertEqual(call_offsets, [0.0, 10.0, 20.0])
+        self.assertEqual(sorted(sampled_frames_by_table), ["T01", "T02"])
+        self.assertEqual(sampling_metadata_by_table["T01"]["observed_frame_count"], 3)
+        self.assertEqual(sampling_metadata_by_table["T02"]["observed_frame_count"], 3)
 
 
 if __name__ == "__main__":
