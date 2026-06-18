@@ -631,10 +631,14 @@ class SimulatorApp(tk.Tk):
             return
         metadata = self.analysis_result.metadata if isinstance(self.analysis_result.metadata, dict) else {}
         sampling_note = ""
-        if metadata.get("sample_mode") == "dynamic_per_table":
+        if metadata.get("sample_mode") in {"dynamic_per_table", "dynamic_shared_decode"}:
             observed_count = int(metadata.get("observed_frame_count", 0))
             selected_count = int(metadata.get("sampled_frame_count", 0))
-            sampling_note = f" | dynamic sampler observed {observed_count} frames and reviewed {selected_count} candidates"
+            decoded_count = int(metadata.get("decoded_frame_count", observed_count))
+            sampling_note = (
+                f" | dynamic sampler decoded {decoded_count} timestamps, observed {observed_count} table-frames, "
+                f"and reviewed {selected_count} candidates"
+            )
         self.result_summary_label.configure(
             text=(
                 self._compact_text(
