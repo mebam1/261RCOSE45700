@@ -25,6 +25,25 @@ from simulator.backend import (
 from simulator.models import AnalysisSessionResult, TableBox
 
 
+def representative_temporal_frame_indices(frames: list[Any]) -> list[int]:
+    if not frames:
+        return []
+    if len(frames) <= 1:
+        return [0]
+
+    indices = {0, len(frames) - 1}
+    previous_frame_state = str(getattr(frames[0], "frame_state", ""))
+    previous_final_state = str(getattr(frames[0], "final_state", ""))
+    for index, frame in enumerate(frames[1:], start=1):
+        current_frame_state = str(getattr(frame, "frame_state", ""))
+        current_final_state = str(getattr(frame, "final_state", ""))
+        if current_frame_state != previous_frame_state or current_final_state != previous_final_state:
+            indices.add(index)
+        previous_frame_state = current_frame_state
+        previous_final_state = current_final_state
+    return sorted(indices)
+
+
 class SimulatorApp(tk.Tk):
     def __init__(self, project_root: Path) -> None:
         super().__init__()
@@ -791,17 +810,7 @@ class SimulatorApp(tk.Tk):
             ttk.Label(caption, text=self._ascii_text(line), style="Caption.TLabel", width=32, anchor="center").pack(fill="x")
 
     def _representative_temporal_frames(self, frames: list[Any]) -> list[Any]:
-        if len(frames) <= 3:
-            return frames
-        interesting_index = next(
-            (
-                index
-                for index, frame in enumerate(frames)
-                if getattr(frame, "frame_type", "periodic_sample") != "periodic_sample"
-            ),
-            len(frames) // 2,
-        )
-        indices = sorted({0, interesting_index, len(frames) - 1})
+        indices = representative_temporal_frame_indices(frames)
         return [frames[index] for index in indices]
 
     def _clear_container(self, container: ttk.Frame) -> None:
